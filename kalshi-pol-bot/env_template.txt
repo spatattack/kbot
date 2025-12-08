@@ -1,0 +1,103 @@
+# Simple Kalshi Trading Bot Environment Configuration
+# Copy this file to .env and fill in your API credentials
+
+# =============================================================================
+# KALSHI API CONFIGURATION
+# =============================================================================
+
+# Kalshi API credentials
+KALSHI_API_KEY=your_kalshi_api_key_here
+
+# Kalshi Private Key (PEM format) - IMPORTANT: Include the full PEM key with \n for line breaks
+# Format: KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----"
+# OR use a file path: KALSHI_PRIVATE_KEY_FILE=/path/to/your/private_key.pem
+KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nyour_private_key_content_here\n-----END RSA PRIVATE KEY-----"
+
+# Environment (use demo for testing)
+KALSHI_USE_DEMO=true
+
+# =============================================================================
+# OCTAGON DEEP RESEARCH API CONFIGURATION
+# =============================================================================
+
+# Octagon API credentials
+OCTAGON_API_KEY=your_octagon_api_key_here
+OCTAGON_BASE_URL=https://api-gateway.octagonagents.com/v1
+
+# =============================================================================
+# OPENAI API CONFIGURATION
+# =============================================================================
+
+# OpenAI API for structured betting decisions
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-5
+
+# =============================================================================
+# BOT CONFIGURATION
+# =============================================================================
+
+# Market processing limits
+MAX_BET_AMOUNT=25.0
+
+# Event analysis configuration
+MAX_EVENTS_TO_ANALYZE=50      # Number of top events to analyze by 24h volume
+RESEARCH_BATCH_SIZE=10        # Number of parallel deep research requests (1-20 recommended)
+SKIP_EXISTING_POSITIONS=true # Skip betting on markets where we already have positions
+MINIMUM_TIME_REMAINING_HOURS=1.0  # Minimum hours remaining before event strike to consider it tradeable (only applied to events with strike_date)
+MAX_MARKETS_PER_EVENT=10     # Maximum number of markets per event to analyze (selects top N markets by volume)
+MINIMUM_ALPHA_THRESHOLD=2.0  # Minimum alpha threshold for betting (research_price / market_price must be >= this value)
+
+# Risk management / hedging configuration
+ENABLE_HEDGING=true           # Enable hedging to minimize risk and protect downside
+HEDGE_RATIO=0.25              # Default hedge ratio (0.25 = hedge 25% of main bet on opposite side)
+MIN_CONFIDENCE_FOR_HEDGING=0.6 # Only hedge bets with confidence below this threshold (0.6 = hedge when confidence < 60%)
+MAX_HEDGE_AMOUNT=50.0         # Maximum hedge amount per bet in dollars
+
+# =============================================================================
+# SETUP INSTRUCTIONS
+# =============================================================================
+
+# 1. Get Kalshi API credentials:
+#    - Go to https://kalshi.com/profile/api (or demo.kalshi.co for demo)
+#    - Generate API key and download private key
+#    - For demo: use demo.kalshi.co with separate demo credentials
+#    - For production: use api.kalshi.co with production credentials
+
+# 2. Format your private key properly:
+#    OPTION A: In .env file with \n (recommended for testing)
+#    KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----"
+#    
+#    OPTION B: Use a separate file (recommended for production)
+#    KALSHI_PRIVATE_KEY_FILE=kalshi_private_key.pem
+#    
+#    OPTION C: Multi-line format in .env (may not work with all parsers)
+#    KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----
+#    MIIEpAIBAAKCAQEA...
+#    -----END RSA PRIVATE KEY-----"
+
+# 3. Get Octagon API key:
+#    - Contact Octagon team for API access
+#    - Replace OCTAGON_API_KEY with your actual key
+
+# 4. Get OpenAI API key:
+#    - Go to https://platform.openai.com/api-keys
+#    - Create a new API key
+#    - Ensure you have access to GPT-4 models
+
+# 5. Test setup:
+#    - Start with DRY_RUN=true and KALSHI_USE_DEMO=true
+#    - Test with small MAX_EVENTS_TO_ANALYZE (5-10) first
+#    - Only use production after thorough testing
+
+# =============================================================================
+# RECOMMENDED TESTING FLOW
+# =============================================================================
+
+# Phase 1: Demo + Dry Run
+# KALSHI_USE_DEMO=true, DRY_RUN=true, MAX_EVENTS_TO_ANALYZE=5
+
+# Phase 2: Demo + Live Trading  
+# KALSHI_USE_DEMO=true, DRY_RUN=false, MAX_EVENTS_TO_ANALYZE=10
+
+# Phase 3: Production + Live Trading
+# KALSHI_USE_DEMO=false, DRY_RUN=false, MAX_EVENTS_TO_ANALYZE=50 
