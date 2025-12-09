@@ -5,16 +5,12 @@ import asyncio
 import argparse
 import json
 import csv
-import json
-import csv
-import datetime
 import math
-from pathlib import Path
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-import time
+from typing import Dict, Any, List, Optional, Tuple
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -227,8 +223,12 @@ class SimpleTradingBot:
             
         elif self.config.portfolio_selection_method == "diversified":
             # Future enhancement: could implement diversification by event category, etc.
-            # For now, fall back to top R-scores
-            return self.apply_portfolio_selection(analysis, event_ticker)
+            # For now, fall back to top R-scores by temporarily changing method
+            original_method = self.config.portfolio_selection_method
+            self.config.portfolio_selection_method = "top_r_scores"
+            result = self.apply_portfolio_selection(analysis, event_ticker)
+            self.config.portfolio_selection_method = original_method
+            return result
         
         return analysis
     
@@ -486,6 +486,24 @@ class SimpleTradingBot:
         """Research each event and its markets using Octagon Deep Research."""
         self.console.print(f"\n[bold]Step 3: Researching {len(event_markets)} events...[/bold]")
         
+        # Filter out events with empty markets before research
+        events_with_markets = {}
+        events_skipped_empty = 0
+        for event_ticker, data in event_markets.items():
+            markets = data.get('markets', [])
+            if markets:
+                events_with_markets[event_ticker] = data
+            else:
+                events_skipped_empty += 1
+                self.console.print(f"[yellow]⚠ Skipping {event_ticker}: No markets to research[/yellow]")
+        
+        if events_skipped_empty > 0:
+            self.console.print(f"[yellow]⚠ Skipped {events_skipped_empty} events with no markets[/yellow]")
+        
+        if not events_with_markets:
+            self.console.print("[red]✗ No events with markets to research[/red]")
+            return {}
+        
         research_results = {}
         
         with Progress(
@@ -493,11 +511,11 @@ class SimpleTradingBot:
             TextColumn("[progress.description]{task.description}"),
             console=self.console,
         ) as progress:
-            task = progress.add_task("Researching events...", total=len(event_markets))
+            task = progress.add_task("Researching events...", total=len(events_with_markets))
             
             # Research events in batches to avoid rate limits
             batch_size = self.config.research_batch_size
-            event_items = list(event_markets.items())
+            event_items = list(events_with_markets.items())
             
             for i in range(0, len(event_items), batch_size):
                 batch = event_items[i:i + batch_size]
@@ -513,6 +531,8 @@ class SimpleTradingBot:
                         # Apply per-event timeout to avoid hanging the whole batch
                         tasks.append(asyncio.wait_for(coro, timeout=self.config.research_timeout_seconds))
                     else:
+                        # This shouldn't happen now, but handle it gracefully
+                        self.console.print(f"[yellow]⚠ Skipping {event_ticker}: Missing event or markets data[/yellow]")
                         tasks.append(asyncio.sleep(0, result=None))
                 
                 try:
@@ -527,6 +547,10 @@ class SimpleTradingBot:
                             err = result
                             if isinstance(result, asyncio.TimeoutError):
                                 err = f"Timeout after {self.config.research_timeout_seconds}s"
+                            elif result is None:
+                                err = "No result returned (empty markets or missing data)"
+                            elif isinstance(result, Exception):
+                                err = str(result)
                             self.console.print(f"[red]✗ Failed to research {event_ticker}: {err}[/red]")
                             progress.update(task, advance=1)
                 
@@ -544,7 +568,7 @@ class SimpleTradingBot:
         return research_results
     
     async def _extract_probabilities_for_event(self, event_ticker: str, research_text: str, 
-                                              event_markets: Dict[str, Dict[str, Any]]) -> tuple[str, Optional[ProbabilityExtraction]]:
+                                              event_markets: Dict[str, Dict[str, Any]]) -> Tuple[str, Optional[ProbabilityExtraction]]:
         """Extract probabilities for a single event."""
         try:
             # Get market information for this event
@@ -707,7 +731,7 @@ class SimpleTradingBot:
     
     async def _get_betting_decisions_for_event(self, event_ticker: str, data: Dict[str, Any], 
                                              probability_extraction: ProbabilityExtraction, 
-                                             market_odds: Dict[str, Dict[str, Any]]) -> tuple[str, Optional[MarketAnalysis]]:
+                                             market_odds: Dict[str, Dict[str, Any]]) -> Tuple[str, Optional[MarketAnalysis]]:
         """Get betting decisions for a single event with error handling."""
         try:
             # Get event-specific decisions

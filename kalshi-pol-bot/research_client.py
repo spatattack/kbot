@@ -11,10 +11,9 @@ class OctagonClient:
     """
     Drop-in replacement for the old Octagon research client.
 
-    - Keeps the same class name so trading_bot.py doesn't need changes.
+    - Keeps the same class name so trading_bot.py does not need changes.
     - Uses OpenAI directly via OPENAI_API_KEY / OPENAI_MODEL.
-    - research_event(...) returns a plain text string, which the bot can
-      later parse or do .replace(...) on.
+    - research_event(...) returns a plain text string that the bot can parse.
     """
 
     def __init__(self, config: Optional[Any] = None) -> None:
@@ -27,26 +26,30 @@ class OctagonClient:
                 "No OpenAI API key found. Set OPENAI_API_KEY (or OCTAGON_API_KEY) in your .env."
             )
 
-        # Allow overriding the model via env
-        # e.g. OPENAI_MODEL=gpt-5-mini or gpt-4.1-mini
+        # Allow overriding the model via env, default to a known good chat model
+        # Example: OPENAI_MODEL=gpt-4.1-mini or gpt-4o-mini
         self.model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
         self.client = AsyncOpenAI(api_key=api_key)
 
-    async def research_event(self, event: Dict[str, Any], markets: List[Dict[str, Any]]) -> str:
+    async def research_event(
+        self,
+        event: Dict[str, Any],
+        markets: List[Dict[str, Any]],
+    ) -> str:
         """
         Run research on an event + markets and return a textual analysis.
 
         trading_bot.py expects a STRING from this method.
         """
 
+        event_ticker = event.get("event_ticker", "UNKNOWN")
         try:
-            event_ticker = event.get("event_ticker", "UNKNOWN")
             title = event.get("title", "")
             subtitle = event.get("subtitle", "")
             category = event.get("category", "")
 
-            markets_summary = []
+            markets_summary: List[str] = []
             for m in markets:
                 ticker = m.get("ticker", "")
                 m_title = m.get("title", "")
@@ -73,11 +76,11 @@ Markets for this event:
 For each market, do the following:
 1. Briefly summarize the key considerations (polls, fundamentals, news, etc.).
 2. Estimate the probability that the YES side will resolve as true (0–100%).
-3. Give a short recommendation (e.g. 'YES is underpriced', 'NO is underpriced', or 'fairly priced').
+3. Give a short recommendation (for example: 'YES is underpriced', 'NO is underpriced', or 'fairly priced').
 
-Return your answer as clear, readable text, with each market on its own section,
+Return your answer as clear, readable text, with each market in its own section,
 including the market TICKER, estimated probability, and recommendation.
-"""
+""".strip()
 
             logger.info(
                 f"Researching event {event_ticker} with OpenAI model {self.model}"
@@ -86,26 +89,50 @@ including the market TICKER, estimated probability, and recommendation.
             # Minimal, compatible call for current OpenAI chat API
             response = await self.client.chat.completions.create(
                 model=self.model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a careful, numerically grounded political prediction analyst.",
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
                 max_completion_tokens=800,
             )
 
-            content = response.choices[0].message.content or ""
-            if not content.strip():
-                logger.error(f"Empty content returned for event {event_ticker}")
+            # Handle different content shapes safely
+            raw_content = response.choices[0].message.content
+
+            if isinstance(raw_content, list):
+                parts: List[str] = []
+                for part in raw_content:
+                    if isinstance(part, dict):
+                        # Newer clients sometimes use {"type": "text", "text": "..."}
+                        text = part.get("text") or part.get("content") or ""
+                        parts.append(str(text))
+                    else:
+                        parts.append(str(part))
+                content = "\n".join(parts).strip()
+            else:
+                content = (raw_content or "").strip()
+
+            if not content:
+                logger.error(
+                    f"Empty content returned for event {event_ticker}. Full response: {response}"
+                )
                 return f"Error: empty research content for event {event_ticker}"
 
             logger.info(f"Completed research for event {event_ticker}")
             return content
 
         except Exception as e:
-            # Catch EVERYTHING to avoid bubbling exceptions into trading_bot
-            logger.exception(f"Error researching event {event.get('event_ticker', 'UNKNOWN')}: {e}")
-            return f"Error researching event {event.get('event_ticker', 'UNKNOWN')}: {e}"
+            logger.exception(f"Error researching event {event_ticker}: {e}")
+            return f"Error researching event {event_ticker}: {e}"
 
     async def close(self) -> None:
         """
-        Kept for API compatibility; AsyncOpenAI doesn't require explicit close.
+        Kept for API compatibility; AsyncOpenAI does not require explicit close.
         """
         return None
-

@@ -103,7 +103,7 @@ class BotConfig(BaseSettings):
     enable_kelly_sizing: bool = Field(default=True, description="Use Kelly criterion for position sizing")
     kelly_fraction: float = Field(default=0.5, ge=0.1, le=1.0, description="Fraction of Kelly to use (0.5 = half-Kelly)")
     max_kelly_bet_fraction: float = Field(default=0.1, ge=0.01, le=0.5, description="Maximum fraction of bankroll per bet")
-    bankroll: float = Field(default=1000.0, description="Total bankroll for Kelly sizing calculations")
+    bankroll: float = Field(default=100.0, description="Total bankroll for Kelly sizing calculations")
     
     # Portfolio management
     max_portfolio_positions: int = Field(default=10, description="Maximum number of positions to hold simultaneously")
