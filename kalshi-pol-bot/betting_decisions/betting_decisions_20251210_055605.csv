@@ -1,0 +1,4 @@
+timestamp,event_ticker,market_ticker,market_name,action,amount,confidence,r_score,expected_return,reasoning
+2025-12-10T05:56:05.438115,KXFEDMENTION-25DEC,KXFEDMENTION-25DEC-REST,Will Powell say Restrictive at his Dec 2025 press conference?,buy_no,2.0,0.8,1.2983964469041545,5.666666666666667,NO edge: research implies NO at 30.0% vs market NO at 10.5% (R-score 1.30)
+2025-12-10T05:56:05.438130,KXFEDMENTION-25DEC,KXFEDMENTION-25DEC-BALA,Will Powell say Balance Sheet at his Dec 2025 press conference?,buy_no,2.0,0.75,1.257941804066302,11.99999999999999,NO edge: research implies NO at 35.0% vs market NO at 5.0% (R-score 1.26)
+2025-12-10T05:56:05.438157,KXABRAHAMQ-27,KXABRAHAMQ-27-JAN01,"Will Israel and Saudi Arabia normalize relations before Jan 1, 2027?",buy_yes,2.0,0.8,1.3418045910040555,64.0,"YES edge: research 65.0% vs market 1.0% (edge 64.0 pts, R-score 1.34)"

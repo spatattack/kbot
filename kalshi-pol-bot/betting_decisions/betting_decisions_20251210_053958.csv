@@ -1,0 +1,2 @@
+timestamp,event_ticker,market_ticker,market_name,action,amount,confidence,r_score,expected_return,reasoning
+2025-12-10T05:39:58.482402,KXFEDMENTION-25DEC,KXFEDMENTION-25DEC-BALA,Will Powell say Balance Sheet at his Dec 2025 press conference?,buy_no,2.0,0.75,1.4184162865339502,12.999999999999988,NO edge: research implies NO at 30.0% vs market NO at 5.0% (R-score 1.42)

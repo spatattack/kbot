@@ -1,0 +1,2 @@
+timestamp,event_ticker,market_ticker,market_name,action,amount,confidence,r_score,expected_return,reasoning
+2025-12-10T04:44:25.294460,KXABRAHAMQ-27,KXABRAHAMQ-27-JAN01,"Will Israel and Saudi Arabia normalize relations before Jan 1, 2027?",buy_yes,2.0,0.8,1.3418045910040555,64.0,"YES edge: research 65.0% vs market 1.0% (edge 64.0 pts, R-score 1.34)"
