@@ -1,1995 +1,1429 @@
+#!/usr/bin/env python3
 """
-Simple Kalshi trading bot with Octagon research and OpenAI decision making.
+Kalshi Political Markets Trading Bot - Institutional Grade
+Ultra-selective trading with professional-level decision making.
+
+Key Principles:
+1. Only bet on truly inefficient markets
+2. Require clear mispricing thesis
+3. High conviction thresholds (15%+ edge)
+4. Research quality scoring
+5. Continuous market monitoring
+6. Conservative position sizing (2% max)
 """
+
 import asyncio
-import argparse
-import json
 import csv
+import json
+import logging
 import math
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
-
-from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from loguru import logger
+import os
 import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
-from kalshi_client import KalshiClient
-from research_client import OctagonClient
-from betting_models import BettingDecision, MarketAnalysis, ProbabilityExtraction
-from config import load_config
 import openai
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
+from rich.text import Text
+
+from betting_models import BettingDecision, MarketProbability, ProbabilityExtraction
+from capital_manager import CapitalManager
+from config import BotConfig, load_config
+from kalshi_client import KalshiClient
+from openai_utils import responses_parse_pydantic
+from position_manager import PositionManager, CorrelationAnalyzer, AdverseSelectionFilter
+from research_client import OctagonClient
+from perplexity_client import PerplexityClient
+
+# Configure logging - SUPPRESS NOISE
+logging.basicConfig(
+    level=logging.INFO,  # Only show warnings and errors
+    format="%(message)s",  # Clean format
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
+# SUPPRESS ALL NOISY LOGGERS
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("kalshi_client").setLevel(logging.CRITICAL)
+logging.getLogger("capital_manager").setLevel(logging.CRITICAL)
+logging.getLogger("position_manager").setLevel(logging.CRITICAL)
+logging.getLogger("trading_bot").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("openai").setLevel(logging.CRITICAL)
+
+# Rich console for UI
+console = Console()
 
 
-class SimpleTradingBot:
-    """Simple trading bot that follows a clear workflow."""
-
-    def __init__(self, live_trading: bool = False, max_close_ts: Optional[int] = None):
-        self.config = load_config()
-        # Override dry_run based on CLI parameter
-        self.config.dry_run = not live_trading
-        self.console = Console()
-        self.kalshi_client = None
-        self.research_client = None
-        self.openai_client = None
-        self.max_close_ts = max_close_ts
-
-    async def initialize(self):
-        """Initialize all API clients."""
-        self.console.print("[bold blue]Initializing trading bot...[/bold blue]")
-
-        # Initialize clients
-        self.kalshi_client = KalshiClient(
-            self.config.kalshi,
-            self.config.minimum_time_remaining_hours,
-            self.config.max_markets_per_event,
-            max_close_ts=self.max_close_ts,
-        )
-        self.research_client = OctagonClient(self.config.octagon)
-        self.openai_client = openai.AsyncOpenAI(api_key=self.config.openai.api_key)
-
-        # Test connections
-        await self.kalshi_client.login()
-        self.console.print("[green]✓ Kalshi API connected[/green]")
-        self.console.print("[green]✓ Octagon API ready[/green]")
-        self.console.print("[green]✓ OpenAI API ready[/green]")
-
-        # Show environment info
-        env_color = "green" if self.config.kalshi.use_demo else "yellow"
-        env_name = "DEMO" if self.config.kalshi.use_demo else "PRODUCTION"
-        mode = "DRY RUN" if self.config.dry_run else "LIVE TRADING"
-
-        self.console.print(f"\n[{env_color}]Environment: {env_name}[/{env_color}]")
-        self.console.print(f"[blue]Mode: {mode}[/blue]")
-        self.console.print(f"[blue]Max events to analyze: {self.config.max_events_to_analyze}[/blue]")
-        self.console.print(f"[blue]Research batch size: {self.config.research_batch_size}[/blue]")
-        self.console.print(f"[blue]Skip existing positions: {self.config.skip_existing_positions}[/blue]")
-        self.console.print(
-            f"[blue]Minimum time to event strike: "
-            f"{self.config.minimum_time_remaining_hours} hours (for events with strike_date)[/blue]"
-        )
-        self.console.print(f"[blue]Max markets per event: {self.config.max_markets_per_event}[/blue]")
-        self.console.print(f"[blue]Max bet amount: ${self.config.max_bet_amount}[/blue]")
-        hedging_status = "Enabled" if self.config.enable_hedging else "Disabled"
-        self.console.print(
-            f"[blue]Risk hedging: {hedging_status} "
-            f"(ratio: {self.config.hedge_ratio}, "
-            f"min confidence: {self.config.min_confidence_for_hedging})[/blue]"
-        )
-
-        # Show risk-adjusted trading settings
-        z_threshold = float(getattr(self.config, "z_threshold", 1.5))
-        self.console.print(f"[blue]R-score filtering: Enabled (z-threshold: {z_threshold})[/blue]")
-        if self.config.enable_kelly_sizing:
-            self.console.print(
-                f"[blue]Kelly sizing: Enabled (fraction: {self.config.kelly_fraction}, "
-                f"bankroll: ${self.config.bankroll})[/blue]"
-            )
-        self.console.print(
-            f"[blue]Portfolio selection: {self.config.portfolio_selection_method} "
-            f"(max positions: {self.config.max_portfolio_positions})[/blue]\n"
-        )
-        if self.max_close_ts is not None:
-            hours_from_now = (self.max_close_ts - int(time.time())) / 3600
-            self.console.print(
-                f"[blue]Market expiration filter: close before ~{hours_from_now:.1f} hours from now[/blue]"
-            )
-
-    # ---------- Risk metrics helpers ----------
-
-    def calculate_risk_adjusted_metrics(self, research_prob: float, market_price: float, action: str) -> dict:
+class MarketEfficiencyFilter:
+    """
+    Minimal filtering - only skip if volume is extremely high.
+    Evaluate ALL market types - let research decide.
+    """
+    
+    # Only filter if volume is INSANE
+    EXTREME_VOLUME = 750_000  # $750k+ = truly institutional
+    
+    def __init__(self):
+        pass  # No pattern matching!
+    
+    def is_efficient_market(
+        self, 
+        market: Dict,
+        volume_24h: float,
+    ) -> Tuple[bool, str]:
         """
-        Calculate hedge-fund style risk-adjusted metrics.
-
-        Args:
-            research_prob: Research probability (0-1)
-            market_price: Market price (0-1)
-            action: "buy_yes" or "buy_no"
-
+        Only skip if volume is extreme.
+        
         Returns:
-            dict with expected_return, r_score, kelly_fraction
+            (should_skip, reason)
         """
-        try:
-            if action == "buy_yes":
-                p = research_prob
-                y = market_price
-            elif action == "buy_no":
-                p = 1 - research_prob
-                y = market_price
-            else:
-                return {"expected_return": 0.0, "r_score": 0.0, "kelly_fraction": 0.0}
-
-            if y <= 0 or y >= 1 or p <= 0 or p >= 1:
-                return {"expected_return": 0.0, "r_score": 0.0, "kelly_fraction": 0.0}
-
-            # Expected return on capital
-            expected_return = (p - y) / y
-
-            # R-score (z-score style)
-            variance = p * (1 - p)
-            if variance <= 0:
-                return {"expected_return": expected_return, "r_score": 0.0, "kelly_fraction": 0.0}
-            r_score = (p - y) / math.sqrt(variance)
-
-            # Kelly fraction
-            if y >= 1:
-                kelly_fraction = 0.0
-            else:
-                kelly_fraction = (p - y) / (1 - y)
-                kelly_fraction = max(0.0, min(1.0, kelly_fraction))
-
-            return {
-                "expected_return": expected_return,
-                "r_score": r_score,
-                "kelly_fraction": kelly_fraction,
-            }
-        except Exception as e:
-            logger.warning(f"Error calculating risk metrics: {e}")
-            return {"expected_return": 0.0, "r_score": 0.0, "kelly_fraction": 0.0}
-
-    def calculate_kelly_position_size(self, kelly_fraction: float) -> float:
+        # Only filter extreme volume
+        if volume_24h > self.EXTREME_VOLUME:
+            return True, f"Extreme volume ${volume_24h:,.0f} (institutional)"
+        
+        # Everything else is fair game!
+        return False, ""
+    
+    def score_inefficiency_potential(
+        self,
+        market: Dict,
+        volume_24h: float,
+        days_to_expiry: float,
+        spread_cents: int,
+    ) -> Tuple[float, str]:
         """
-        Calculate position size using fractional Kelly criterion.
-
-        Args:
-            kelly_fraction: Optimal Kelly fraction (0-1)
-
+        Score how likely market is to be inefficient (0-10).
+        PERMISSIVE: Most markets should pass.
+        
         Returns:
-            Position size in dollars
+            (score, explanation)
         """
-        max_bet_amount = float(self.config.max_bet_amount)
+        score = 6.0  # Start higher - assume most markets are worth evaluating
+        reasons = []
+        
+        # Efficient market check (only blocks extreme volume)
+        is_efficient, reason = self.is_efficient_market(market, volume_24h)
+        if is_efficient:
+            return 0.0, f"❌ {reason}"
+        
+        # Volume - very permissive
+        if volume_24h >= 50:
+            score += 2.0
+            reasons.append("+2 tradeable volume")
+        elif volume_24h >= 10:
+            score += 1.0
+            reasons.append("+1 low but ok")
+        # No penalty for low volume, just don't add
+        
+        # Time to expiry - very permissive
+        if days_to_expiry >= 1:  # At least 1 day
+            score += 1.0
+            reasons.append("+1 has time")
+        if days_to_expiry < 0.5:  # Only penalize if < 12 hours
+            score -= 2.0
+            reasons.append("-2 too close")
+        # No penalty for far-out dates
+        
+        # Spread - any spread is fine
+        if spread_cents >= 4:
+            score += 1.0
+            reasons.append("+1 wide spread")
+        elif spread_cents >= 2:
+            score += 0.5
+            reasons.append("+0.5 medium")
+        # No penalty for tight spreads
+        
+        score = max(0, min(10, score))
+        explanation = f"{score:.1f}/10 ({', '.join(reasons) if reasons else 'baseline'})"
+        
+        return score, explanation
 
-        if not self.config.enable_kelly_sizing or kelly_fraction <= 0:
-            return max_bet_amount
 
-        adjusted_kelly = kelly_fraction * float(self.config.kelly_fraction)
-        bankroll = float(self.config.bankroll)
-        max_kelly_bet_fraction = float(self.config.max_kelly_bet_fraction)
-
-        kelly_bet_size = bankroll * adjusted_kelly
-
-        max_allowed = bankroll * max_kelly_bet_fraction
-        kelly_bet_size = min(kelly_bet_size, max_allowed)
-        kelly_bet_size = min(kelly_bet_size, max_bet_amount)
-        kelly_bet_size = max(kelly_bet_size, 1.0)
-
-        return float(kelly_bet_size)
-
-    # ---------- Portfolio selection ----------
-
-    def apply_portfolio_selection(self, analysis: MarketAnalysis, event_ticker: str) -> MarketAnalysis:
+class ResearchQualityScorer:
+    """
+    Score research quality before trusting it.
+    Bad research = bad trades.
+    """
+    
+    def score_research(
+        self, 
+        research_text: str, 
+        market_title: str,
+        event_title: str = "",
+    ) -> Tuple[float, str]:
         """
-        Apply portfolio selection to hold only the N highest R-scores.
-        Step 4: Portfolio view - hold the N highest R-scores subject to limits.
+        Score research quality (0-10).
+        
+        Returns:
+            (score, explanation)
         """
-        if self.config.portfolio_selection_method == "legacy":
-            return analysis
-
-        actionable_decisions = [d for d in analysis.decisions if d.action != "skip"]
-        skip_decisions = [d for d in analysis.decisions if d.action == "skip"]
-
-        if not actionable_decisions:
-            return analysis
-
-        if self.config.portfolio_selection_method == "top_r_scores":
-            actionable_decisions.sort(
-                key=lambda d: (d.r_score if d.r_score is not None else -999.0),
-                reverse=True,
-            )
-            max_positions = int(self.config.max_portfolio_positions)
-            selected_decisions = actionable_decisions[:max_positions]
-
-            rejected_decisions = []
-            rank_counter = len(selected_decisions) + 1
-            for decision in actionable_decisions[max_positions:]:
-                r_val = decision.r_score if decision.r_score is not None else float("nan")
-                reason = (
-                    f"Portfolio limit: R-score {r_val:.2f} "
-                    f"ranked #{rank_counter}"
-                )
-                skip_decision = BettingDecision(
-                    ticker=decision.ticker,
-                    action="skip",
-                    confidence=decision.confidence,
-                    amount=0.0,
-                    reasoning=reason,
-                    event_name=decision.event_name,
-                    market_name=decision.market_name,
-                    expected_return=decision.expected_return,
-                    r_score=decision.r_score,
-                    kelly_fraction=decision.kelly_fraction,
-                    market_price=decision.market_price,
-                    research_probability=decision.research_probability,
-                    is_hedge=decision.is_hedge,
-                    hedge_for=decision.hedge_for,
-                    hedge_ratio=decision.hedge_ratio,
-                )
-                rejected_decisions.append(skip_decision)
-                rank_counter += 1
-
-            if rejected_decisions:
-                logger.info(
-                    f"Portfolio selection for {event_ticker}: kept top {len(selected_decisions)} "
-                    f"positions, rejected {len(rejected_decisions)} lower R-score positions"
-                )
-
-            analysis.decisions = selected_decisions + skip_decisions + rejected_decisions
-
-        elif self.config.portfolio_selection_method == "diversified":
-            original_method = self.config.portfolio_selection_method
-            self.config.portfolio_selection_method = "top_r_scores"
-            analysis = self.apply_portfolio_selection(analysis, event_ticker)
-            self.config.portfolio_selection_method = original_method
-
-        # Recompute totals after selection
-        actionable = [d for d in analysis.decisions if d.action != "skip"]
-        analysis.total_recommended_bet = float(sum(d.amount for d in actionable))
-        analysis.high_confidence_bets = len([d for d in actionable if d.confidence > 0.7])
-        return analysis
-
-    # ---------- Event + market discovery ----------
-
-    async def get_top_events(self) -> List[Dict[str, Any]]:
-        """
-        Get top non-sports events, preferring political ones, sorted by 24-hour volume.
-        """
-        self.console.print("[bold]Step 1: Fetching top political / non-sports events...[/bold]")
-
-        political_keywords = [
-            "politic",
-            "election",
-            "primary",
-            "president",
-            "presidential",
-            "senate",
-            "senator",
-            "house",
-            "congress",
-            "governor",
-            "mayor",
-            "parliament",
-            "ballot",
-            "referendum",
-            "white house",
-            "supreme court",
-            "scotus",
+        score = 4.0  # Start slightly pessimistic
+        reasons = []
+        
+        text_lower = research_text.lower()
+        
+        # === POSITIVE SIGNALS ===
+        
+        # Concrete data (the more specific, the better)
+        if re.search(r"\d{1,2}%|\d{1,2}\.\d%", research_text):
+            score += 1.5
+            reasons.append("+1.5 percentages")
+        
+        if re.search(r"poll|survey|study", text_lower):
+            score += 2.0
+            reasons.append("+2.0 polls/surveys")
+        
+        # Recent dates
+        recent_date_patterns = [
+            r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+202\d",
+            r"(yesterday|today|this week|last week)",
+            r"202\d-\d{2}-\d{2}",  # ISO dates
         ]
-
-        sports_keywords = [
-            "nfl",
-            "nba",
-            "mlb",
-            "nhl",
-            "ncaa",
-            "football",
-            "basketball",
-            "baseball",
-            "hockey",
-            "soccer",
-            "tennis",
-            "golf",
-            "sports",
+        for pattern in recent_date_patterns:
+            if re.search(pattern, text_lower):
+                score += 1.5
+                reasons.append("+1.5 recent dates")
+                break
+        
+        # Source attribution
+        source_patterns = [
+            r"according to",
+            r"per\s+(the\s+)?[A-Z]",  # "per The New York Times"
+            r"reported by",
+            r"sources? (say|said|indicate)",
+            r"(reuters|bloomberg|nyt|wsj|politico|ap|cnn|bbc)",
         ]
+        source_count = sum(1 for pattern in source_patterns if re.search(pattern, text_lower))
+        if source_count >= 2:
+            score += 2.0
+            reasons.append("+2.0 multiple sources")
+        elif source_count == 1:
+            score += 1.0
+            reasons.append("+1.0 source cited")
+        
+        # Specific numbers/facts
+        number_count = len(re.findall(r"\d+", research_text))
+        if number_count >= 10:
+            score += 1.0
+            reasons.append("+1.0 many numbers")
+        elif number_count >= 5:
+            score += 0.5
+            reasons.append("+0.5 some numbers")
+        
+        # === NEGATIVE SIGNALS ===
+        
+        # Vague language
+        vague_words = ["might", "could", "possibly", "perhaps", "maybe", "uncertain", "unclear", "potentially"]
+        vague_count = sum(1 for word in vague_words if word in text_lower)
+        if vague_count >= 5:
+            score -= 2.0
+            reasons.append("-2.0 very vague")
+        elif vague_count >= 3:
+            score -= 1.0
+            reasons.append("-1.0 somewhat vague")
+        
+        # Too short (< 200 chars = lazy research)
+        if len(research_text) < 200:
+            score -= 2.0
+            reasons.append("-2.0 too short")
+        
+        # No specific details
+        if not re.search(r"\d", research_text):
+            score -= 2.0
+            reasons.append("-2.0 no numbers")
+        
+        # Check relevance to market
+        market_keywords = set(re.findall(r'\w+', market_title.lower()))
+        event_keywords = set(re.findall(r'\w+', event_title.lower())) if event_title else set()
+        all_keywords = market_keywords | event_keywords
+        
+        research_keywords = set(re.findall(r'\w+', text_lower))
+        overlap_count = len(all_keywords & research_keywords)
+        
+        if overlap_count < 2:
+            score -= 3.0
+            reasons.append("-3.0 low relevance")
+        elif overlap_count >= 5:
+            score += 1.0
+            reasons.append("+1.0 high relevance")
+        
+        # Generic/templated research
+        generic_phrases = [
+            "the outcome of this",
+            "it is important to",
+            "factors to consider",
+            "on the one hand",
+        ]
+        if any(phrase in text_lower for phrase in generic_phrases):
+            score -= 1.0
+            reasons.append("-1.0 generic")
+        
+        # Cap score
+        score = max(0, min(10, score))
+        
+        explanation = f"Research: {score:.1f}/10 ({', '.join(reasons)})"
+        return score, explanation
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task("Fetching events...", total=None)
 
-            try:
-                fetch_limit = self.config.max_events_to_analyze * 3
-                events = await self.kalshi_client.get_events(limit=fetch_limit)
-                progress.update(task, completed=1)
-
-                if not events:
-                    self.console.print("[red]No events returned from Kalshi[/red]")
-                    return []
-
-                # 1) Exclude obvious sports events up front
-                non_sports_events: List[Dict[str, Any]] = []
-                for ev in events:
-                    cat = str(ev.get("category", "")).lower()
-                    ticker = str(ev.get("event_ticker", "")).lower()
-                    title = str(ev.get("title", "")).lower()
-                    blob = " ".join([cat, ticker, title])
-                    if "sport" in cat or any(sk in blob for sk in sports_keywords):
-                        continue
-                    non_sports_events.append(ev)
-
-                if non_sports_events:
-                    self.console.print(
-                        f"[blue]• Fetched {len(events)} events, "
-                        f"{len(non_sports_events)} are non-sports[/blue]"
-                    )
-                else:
-                    # If everything looks like sports, fall back but warn
-                    non_sports_events = events
-                    self.console.print(
-                        "[yellow]Warning: all events look like sports; keeping all for now[/yellow]"
-                    )
-
-                # 2) Among non-sports, try to find political-looking ones
-                political_events: List[Dict[str, Any]] = []
-                for ev in non_sports_events:
-                    text_parts = [
-                        str(ev.get("category", "")),
-                        str(ev.get("title", "")),
-                        str(ev.get("subtitle", "")),
-                        str(ev.get("event_ticker", "")),
-                    ]
-                    blob = " ".join(text_parts).lower()
-                    if any(kw in blob for kw in political_keywords):
-                        political_events.append(ev)
-
-                if political_events:
-                    filtered_events = political_events
-                    self.console.print(
-                        f"[blue]• Found {len(political_events)} political-looking events "
-                        f"within non-sports set[/blue]"
-                    )
-                else:
-                    filtered_events = non_sports_events
-                    self.console.print(
-                        f"[yellow]Warning: did not find clear political events, "
-                        f"using all {len(filtered_events)} non-sports events[/yellow]"
-                    )
-
-                # 3) Optional: light liquidity filter
-                min_volume_24h = float(getattr(self.config, "min_volume_24h", 0) or 0)
-                if min_volume_24h > 0:
-                    before = len(filtered_events)
-                    filtered_events = [
-                        ev
-                        for ev in filtered_events
-                        if float(ev.get("volume_24h") or 0) >= min_volume_24h
-                    ]
-                    self.console.print(
-                        f"[blue]• Liquidity filter: {before} → {len(filtered_events)} "
-                        f"events with volume_24h ≥ {min_volume_24h}[/blue]"
-                    )
-
-                # 4) Sort by 24h volume
-                filtered_events.sort(
-                    key=lambda e: e.get("volume_24h", 0) or 0,
-                    reverse=True,
-                )
-
-                # 5) Truncate to configured max
-                if len(filtered_events) > self.config.max_events_to_analyze:
-                    filtered_events = filtered_events[: self.config.max_events_to_analyze]
-
-                events = filtered_events
-                self.console.print(
-                    f"[green]✓ Selected {len(events)} events for research[/green]"
-                )
-
-                # Preview table
-                table = Table(title="Top Target Events by 24h Volume")
-                table.add_column("Event Ticker", style="cyan")
-                table.add_column("Title", style="yellow")
-                table.add_column("24h Volume", style="magenta", justify="right")
-                table.add_column("Time Remaining", style="blue", justify="right")
-                table.add_column("Category", style="green")
-                table.add_column("Mutually Exclusive", style="red", justify="center")
-
-                now_ts = int(time.time())
-
-                for event in events[:10]:
-                    time_remaining = event.get("time_remaining_hours")
-                    if time_remaining is None:
-                        close_ts = event.get("close_ts")
-                        if isinstance(close_ts, (int, float)):
-                            time_remaining = max(0, (close_ts - now_ts) / 3600)
-                        else:
-                            time_remaining = None
-
-                    if time_remaining is None:
-                        time_str = "No date set"
-                    elif time_remaining > 24:
-                        time_str = f"{time_remaining / 24:.1f} days"
-                    else:
-                        time_str = f"{time_remaining:.1f} hours"
-
-                    title = event.get("title", "N/A")
-                    truncated_title = title[:35] + "..." if len(title) > 35 else title
-
-                    table.add_row(
-                        event.get("event_ticker", "N/A"),
-                        truncated_title,
-                        f"{event.get('volume_24h', 0):,}",
-                        time_str,
-                        event.get("category", "N/A"),
-                        "YES" if event.get("mutually_exclusive", False) else "NO",
-                    )
-
-                self.console.print(table)
-                return events
-
-            except Exception as e:
-                self.console.print(f"[red]Error fetching events: {e}[/red]")
-                return []
-
-    async def get_markets_for_events(
-        self, events: List[Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
-        """Get markets for each event (uses pre-loaded markets from events)."""
-        self.console.print(
-            f"\n[bold]Step 2: Processing markets for {len(events)} events...[/bold]"
-        )
-
-        event_markets: Dict[str, Dict[str, Any]] = {}
-
-        for event in events:
-            event_ticker = event.get("event_ticker", "")
-            if not event_ticker:
-                continue
-
-            markets = event.get("markets", [])
-            total_markets = event.get("total_markets", len(markets))
-
-            if markets:
-                simple_markets = []
-                for market in markets:
-                    simple_markets.append(
-                        {
-                            "ticker": market.get("ticker", ""),
-                            "title": market.get("title", ""),
-                            "subtitle": market.get("subtitle", ""),
-                            "volume": market.get("volume", 0),
-                            "open_time": market.get("open_time", ""),
-                            "close_time": market.get("close_time", ""),
-                        }
-                    )
-
-                event_markets[event_ticker] = {"event": event, "markets": simple_markets}
-
-                if total_markets > len(markets):
-                    self.console.print(
-                        f"[green]✓ Using top {len(markets)} markets for "
-                        f"{event_ticker} (from {total_markets} total)[/green]"
-                    )
-                else:
-                    self.console.print(
-                        f"[green]✓ Using {len(markets)} markets for {event_ticker}[/green]"
-                    )
-            else:
-                self.console.print(
-                    f"[yellow]⚠ No markets found for {event_ticker}[/yellow]"
-                )
-
-        total_markets = sum(len(data["markets"]) for data in event_markets.values())
-        self.console.print(
-            f"[green]✓ Processing {total_markets} total markets across "
-            f"{len(event_markets)} events[/green]"
-        )
-        return event_markets
-
-    async def filter_markets_by_positions(
-        self, event_markets: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
-        """Filter out markets where we already have positions to save research time."""
-        if self.config.dry_run or not self.config.skip_existing_positions:
-            return event_markets
-
-        self.console.print(
-            f"\n[bold]Step 2.5: Filtering markets by existing positions...[/bold]"
-        )
-
-        filtered_event_markets: Dict[str, Dict[str, Any]] = {}
-        total_markets_after = 0
-        skipped_markets = 0
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            total_markets = sum(len(data["markets"]) for data in event_markets.values())
-            task = progress.add_task(
-                "Checking existing positions...", total=total_markets
-            )
-
-            for event_ticker, data in event_markets.items():
-                event = data["event"]
-                markets = data["markets"]
-
-                event_has_positions = False
-                markets_checked = 0
-
-                for market in markets:
-                    ticker = market.get("ticker", "")
-                    if not ticker:
-                        progress.update(task, advance=1)
-                        markets_checked += 1
-                        continue
-
-                    try:
-                        has_position = await self.kalshi_client.has_position_in_market(
-                            ticker
-                        )
-                        if has_position:
-                            self.console.print(
-                                f"[yellow]⚠ Found position in {ticker}[/yellow]"
-                            )
-                            event_has_positions = True
-                            remaining = len(markets) - markets_checked - 1
-                            progress.update(task, advance=remaining + 1)
-                            break
-                    except Exception as e:
-                        logger.warning(
-                            f"Could not check position for {ticker}: {e}"
-                        )
-
-                    progress.update(task, advance=1)
-                    markets_checked += 1
-
-                if event_has_positions:
-                    skipped_markets += len(markets)
-                    self.console.print(
-                        f"[yellow]⚠ Skipping entire event {event_ticker}: "
-                        f"Has existing positions[/yellow]"
-                    )
-                else:
-                    filtered_event_markets[event_ticker] = {
-                        "event": event,
-                        "markets": markets,
-                    }
-                    total_markets_after += len(markets)
-                    self.console.print(
-                        f"[green]✓ Keeping entire event {event_ticker}: "
-                        f"No existing positions[/green]"
-                    )
-
-        events_skipped = len(event_markets) - len(filtered_event_markets)
-        self.console.print(f"\n[blue]Position filtering summary:[/blue]")
-        self.console.print(
-            f"[blue]• Events before filtering: {len(event_markets)}[/blue]"
-        )
-        self.console.print(
-            f"[blue]• Events after filtering: {len(filtered_event_markets)}[/blue]"
-        )
-        self.console.print(
-            f"[blue]• Events skipped (existing positions): {events_skipped}[/blue]"
-        )
-        self.console.print(f"[blue]• Markets in skipped events: {skipped_markets}[/blue]")
-        self.console.print(
-            f"[blue]• Markets remaining for research: {total_markets_after}[/blue]"
-        )
-
-        if len(filtered_event_markets) == 0:
-            self.console.print(
-                "[yellow]⚠ No events remaining after position filtering[/yellow]"
-            )
-        elif events_skipped > 0:
-            time_saved_estimate = events_skipped * 3
-            self.console.print(
-                f"[green]✓ Estimated time saved by skipping research: "
-                f"~{time_saved_estimate} minutes[/green]"
-            )
-
-        return filtered_event_markets
-
-    # ---------- Probability extraction ----------
-
-    def _parse_probabilities_from_research(
-        self, research_text: str, markets: List[Dict[str, Any]]
-    ) -> Dict[str, float]:
-        """Parse probability predictions from research text."""
-        probabilities: Dict[str, float] = {}
-
-        for market in markets:
-            ticker = market.get("ticker", "")
-            title = market.get("title", "")
-            if not ticker:
-                continue
-
-            search_terms = [ticker]
-            if title:
-                search_terms.append(title)
-                title_words = [
-                    w
-                    for w in title.split()
-                    if len(w) > 3
-                    and w.lower()
-                    not in {
-                        "will",
-                        "the",
-                        "win",
-                        "this",
-                        "that",
-                        "with",
-                        "have",
-                        "from",
-                        "into",
-                        "about",
-                        "over",
-                        "under",
-                        "again",
-                        "then",
-                        "once",
-                        "they",
-                        "them",
-                        "what",
-                        "when",
-                        "where",
-                        "which",
-                        "your",
-                        "their",
-                        "there",
-                    }
-                ]
-                search_terms.extend(title_words)
-
-            found_probability: Optional[float] = None
-            for term in search_terms:
-                if not term:
-                    continue
-
-                patterns = [
-                    rf"{re.escape(term)}[:\s]*(\d+\.?\d*)%",
-                    rf"{re.escape(term)}[:\s]*(\d+)%",
-                    rf"(\d+\.?\d*)%[:\s]*{re.escape(term)}",
-                    rf"(\d+)%[:\s]*{re.escape(term)}",
-                    rf"probability.*{re.escape(term)}[:\s]*(\d+\.?\d*)%",
-                    rf"{re.escape(term)}.*probability.*?(\d+\.?\d*)%",
-                    rf"{re.escape(term)}.*(\d+\.?\d*)%.*probability",
-                    rf"probability.*(\d+\.?\d*)%.*{re.escape(term)}",
-                    rf"{re.escape(term)}.*?(\d+\.?\d*)%",
-                    rf"(\d+\.?\d*)%.*?{re.escape(term)}",
-                ]
-
-                for pattern in patterns:
-                    matches = re.findall(
-                        pattern, research_text, re.IGNORECASE | re.DOTALL
-                    )
-                    if matches:
-                        try:
-                            prob = float(matches[0])
-                            if 0 <= prob <= 100:
-                                found_probability = prob
-                                break
-                        except ValueError:
-                            continue
-
-                if found_probability is not None:
-                    break
-
-            if found_probability is not None:
-                probabilities[ticker] = found_probability
-                logger.info(f"Found probability for {ticker}: {found_probability}%")
-            else:
-                logger.warning(
-                    f"No probability found for {ticker} (title: {title})"
-                )
-
-        return probabilities
-
-    def _is_prob_extraction_trustworthy(
-        self, extraction: ProbabilityExtraction, is_mutually_exclusive: bool
-    ) -> bool:
-        """Heuristic sanity checks on LLM / parsed probabilities."""
-        try:
-            probs = [float(mp.research_probability) for mp in extraction.markets]
-            if not probs:
-                return False
-
-            if is_mutually_exclusive:
-                s = sum(probs)
-                if s < 50 or s > 200:
-                    logger.warning(
-                        f"Probability sum {s:.1f} out of range for mutually "
-                        f"exclusive event"
-                    )
-                    return False
-
-            mean = sum(probs) / len(probs)
-            variance = sum((p - mean) ** 2 for p in probs) / len(probs)
-            if variance < 5.0:
-                logger.warning(
-                    f"Probability extraction variance {variance:.2f} too low; "
-                    f"treating as uninformative"
-                )
-                return False
-
-            return True
-        except Exception as e:
-            logger.error(f"Error in probability trust check: {e}")
-            return False
-
-    def _postprocess_probability_extraction(
+class MispricingAnalyzer:
+    """
+    Analyze WHY a market is mispriced before betting.
+    If we can't explain it, don't bet.
+    """
+    
+    async def analyze_mispricing(
         self,
-        event_ticker: str,
-        extraction: ProbabilityExtraction,
-        event_markets: Dict[str, Dict[str, Any]],
-    ) -> Optional[ProbabilityExtraction]:
-        """
-        Clamp probabilities, renormalize mutually exclusive events, and
-        discard obviously bad extractions.
-        """
-        try:
-            event_data = event_markets.get(event_ticker, {})
-            event_info = event_data.get("event", {})
-            is_mutually_exclusive = bool(event_info.get("mutually_exclusive", False))
-
-            # Clamp probabilities to [1, 99] and fix NaNs
-            for mp in extraction.markets:
-                p = float(mp.research_probability)
-                if math.isnan(p) or math.isinf(p):
-                    p = 50.0
-                mp.research_probability = max(1.0, min(99.0, p))
-
-            # Renormalize for mutually exclusive events
-            if is_mutually_exclusive and extraction.markets:
-                total = sum(mp.research_probability for mp in extraction.markets)
-                if total > 0:
-                    for mp in extraction.markets:
-                        mp.research_probability = mp.research_probability * 100.0 / total
-
-            # Trust check
-            if not self._is_prob_extraction_trustworthy(
-                extraction, is_mutually_exclusive
-            ):
-                logger.warning(
-                    f"Probability extraction for {event_ticker} failed trust checks; "
-                    f"skipping event."
-                )
-                return None
-
-            return extraction
-        except Exception as e:
-            logger.error(
-                f"Error post-processing probabilities for {event_ticker}: {e}"
-            )
-            return None
-
-    async def research_events(
-        self, event_markets: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, str]:
-        """Research each event and its markets using Octagon Deep Research."""
-        self.console.print(
-            f"\n[bold]Step 3: Researching {len(event_markets)} events...[/bold]"
-        )
-
-        events_with_markets: Dict[str, Dict[str, Any]] = {}
-        events_skipped_empty = 0
-        for event_ticker, data in event_markets.items():
-            markets = data.get("markets", [])
-            if markets:
-                events_with_markets[event_ticker] = data
-            else:
-                events_skipped_empty += 1
-                self.console.print(
-                    f"[yellow]⚠ Skipping {event_ticker}: No markets to research[/yellow]"
-                )
-
-        if events_skipped_empty > 0:
-            self.console.print(
-                f"[yellow]⚠ Skipped {events_skipped_empty} events with no markets[/yellow]"
-            )
-
-        if not events_with_markets:
-            self.console.print("[red]✗ No events with markets to research[/red]")
-            return {}
-
-        research_results: Dict[str, str] = {}
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            task = progress.add_task(
-                "Researching events...", total=len(events_with_markets)
-            )
-
-            batch_size = self.config.research_batch_size
-            event_items = list(events_with_markets.items())
-
-            for i in range(0, len(event_items), batch_size):
-                batch = event_items[i : i + batch_size]
-                self.console.print(
-                    f"[blue]Processing research batch {i // batch_size + 1} "
-                    f"with {len(batch)} events[/blue]"
-                )
-
-                tasks = []
-                for event_ticker, data in batch:
-                    event = data["event"]
-                    markets = data["markets"]
-                    if event and markets:
-                        coro = self.research_client.research_event(event, markets)
-                        tasks.append(
-                            asyncio.wait_for(
-                                coro,
-                                timeout=self.config.research_timeout_seconds,
-                            )
-                        )
-                    else:
-                        tasks.append(asyncio.sleep(0, result=None))
-
-                try:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    for (event_ticker, _), result in zip(batch, results):
-                        if not isinstance(result, Exception) and result:
-                            research_results[event_ticker] = result
-                            progress.update(task, advance=1)
-                            self.console.print(
-                                f"[green]✓ Researched {event_ticker}[/green]"
-                            )
-                        else:
-                            if isinstance(result, asyncio.TimeoutError):
-                                err = (
-                                    f"Timeout after "
-                                    f"{self.config.research_timeout_seconds}s"
-                                )
-                            elif result is None:
-                                err = "No result returned"
-                            elif isinstance(result, Exception):
-                                err = str(result)
-                            else:
-                                err = "Unknown error"
-
-                            self.console.print(
-                                f"[red]✗ Failed to research {event_ticker}: "
-                                f"{err}[/red]"
-                            )
-                            progress.update(task, advance=1)
-                except Exception as e:
-                    self.console.print(f"[red]Batch research error: {e}[/red]")
-                    progress.update(task, advance=len(batch))
-
-                await asyncio.sleep(1)
-
-        self.console.print(
-            f"[green]✓ Completed research on {len(research_results)} events[/green]"
-        )
-        return research_results
-
-    async def _extract_probabilities_for_event(
-        self,
-        event_ticker: str,
+        market: Dict,
+        research_prob: float,
+        market_prob: float,
         research_text: str,
-        event_markets: Dict[str, Dict[str, Any]],
-    ) -> Tuple[str, Optional[ProbabilityExtraction]]:
+        openai_client: openai.AsyncOpenAI,
+    ) -> Tuple[bool, str, float]:
         """
-        Extract probabilities for a single event by parsing the research text.
+        Determine if mispricing is real and tradeable.
+        
+        Returns:
+            (is_tradeable, explanation, conviction_score)
         """
+        edge_pct = abs(research_prob - market_prob) * 100
+        direction = "overpriced" if market_prob > research_prob else "underpriced"
+        
+        # Build analysis prompt
+        prompt = f"""You are a professional prediction market trader analyzing a potential mispricing.
+
+Market: {market.get('title', '')}
+Market Price: {market_prob*100:.1f}%
+Research Estimate: {research_prob*100:.1f}%
+Edge: {edge_pct:.1f} percentage points ({direction})
+
+Research Summary:
+{research_text[:800]}
+
+Analyze this potential trade critically:
+
+1. **Why might the market be wrong?**
+   - Information asymmetry?
+   - Complexity market missed?
+   - Recency bias in market?
+   - Technical factors?
+
+2. **Why might WE be wrong?**
+   - Is our research missing something?
+   - Is the market seeing something we're not?
+   - Could this be adverse selection?
+
+3. **Base rate reasoning:**
+   - How often do markets misprice by this amount?
+   - What's the base rate for this type of event?
+
+4. **Trade conviction:**
+   - Rate 0-10 how convinced you are this is real edge
+   - What could change your mind?
+
+Return JSON:
+{{
+  "is_tradeable": boolean,
+  "explanation": "2-3 sentence summary",
+  "conviction_score": float (0-10),
+  "key_risk": "main thing that could make us wrong"
+}}
+"""
+        
         try:
-            event_data = event_markets.get(event_ticker, {})
-            markets = event_data.get("markets", [])
-            event_info = event_data.get("event", {})
-
-            if not markets:
-                logger.warning(
-                    f"No markets found for event {event_ticker} when extracting "
-                    f"probabilities."
-                )
-                return event_ticker, None
-
-            parsed_probs = self._parse_probabilities_from_research(research_text, markets)
-
-            if not parsed_probs:
-                logger.warning(
-                    f"No probabilities could be parsed from research for "
-                    f"event {event_ticker}."
-                )
-                return event_ticker, None
-
-            markets_payload = []
-            for market in markets:
-                ticker = market.get("ticker", "")
-                if not ticker:
-                    continue
-                prob = parsed_probs.get(ticker)
-                if prob is None:
-                    continue
-
-                confidence = 0.7
-                markets_payload.append(
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
                     {
-                        "ticker": ticker,
-                        "title": market.get("title", ""),
-                        "research_probability": float(prob),
-                        "reasoning": (
-                            f"Probability {prob:.1f}% inferred from research text "
-                            f"for {ticker}."
-                        ),
-                        "confidence": float(confidence),
-                    }
-                )
-
-            if not markets_payload:
-                logger.warning(
-                    f"Parsed probabilities for event {event_ticker}, "
-                    f"but none matched specific markets."
-                )
-                return event_ticker, None
-
-            overall_summary = (
-                f"Probabilities parsed from research text for event "
-                f"{event_info.get('title', event_ticker)}."
+                        "role": "system", 
+                        "content": "You are a skeptical, risk-aware prediction market analyst."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3,
             )
-
-            extraction = ProbabilityExtraction(
-                markets=markets_payload,
-                overall_summary=overall_summary,
-            )
-
-            extraction = self._postprocess_probability_extraction(
-                event_ticker, extraction, event_markets
-            )
-            return event_ticker, extraction
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            is_tradeable = result.get("is_tradeable", False)
+            explanation = result.get("explanation", "No explanation provided")
+            conviction = float(result.get("conviction_score", 0))
+            key_risk = result.get("key_risk", "Unknown")
+            
+            full_explanation = f"{explanation} [Key risk: {key_risk}]"
+            
+            return is_tradeable, full_explanation, conviction
+            
         except Exception as e:
-            logger.error(f"Error extracting probabilities for {event_ticker}: {e}")
-            return event_ticker, None
+            logger.error(f"Mispricing analysis failed: {e}")
+            return False, f"Analysis failed: {e}", 0.0
 
-    async def extract_probabilities(
-        self,
-        research_results: Dict[str, str],
-        event_markets: Dict[str, Dict[str, Any]],
-    ) -> Dict[str, ProbabilityExtraction]:
-        """
-        Extract structured probabilities from research results.
-        """
-        self.console.print(
-            f"\n[bold]Step 3.5: Extracting probabilities from research.[/bold]"
-        )
 
-        probability_extractions: Dict[str, ProbabilityExtraction] = {}
-
-        if not research_results:
-            self.console.print(
-                "[yellow]No research results to extract probabilities from[/yellow]"
-            )
-            return probability_extractions
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            task = progress.add_task(
-                "Extracting probabilities...", total=len(research_results)
-            )
-
-            tasks = []
-            for event_ticker, research_text in research_results.items():
-                task_coroutine = self._extract_probabilities_for_event(
-                    event_ticker, research_text, event_markets
+class KalshiInstitutionalBot:
+    """
+    Institutional-grade trading bot.
+    Beats the market by being smarter, not faster.
+    """
+    
+    def __init__(self, config: BotConfig):
+        """Initialize the bot with configuration."""
+        self.config = config
+        
+        # Core clients
+        self.kalshi_client = KalshiClient(config.kalshi)
+        self.research_client = OctagonClient(config.octagon)
+        self.openai_client = openai.AsyncOpenAI(api_key=config.openai.api_key)
+        
+        # Perplexity for real-time web research
+        self.perplexity_client = None
+        self.perplexity_enabled = False
+        console.print("\n[bold cyan]🔧 Initializing Perplexity Research API...[/bold cyan]")
+        logger.warning(f"PERPLEXITY CONFIG: enabled={config.perplexity.enabled}, has_api_key={bool(config.perplexity.api_key)}")
+        
+        if config.perplexity.enabled and config.perplexity.api_key:
+            try:
+                console.print(f"[dim]  Creating client with model: {config.perplexity.model}[/dim]")
+                self.perplexity_client = PerplexityClient(
+                    api_key=config.perplexity.api_key,
+                    model=config.perplexity.model
                 )
-                tasks.append(task_coroutine)
-
-            for coro in asyncio.as_completed(tasks):
-                try:
-                    event_ticker, extraction = await coro
-                    if extraction is not None:
-                        probability_extractions[event_ticker] = extraction
-                    progress.update(task, advance=1)
-                except Exception as e:
-                    logger.error(f"Batch probability extraction error: {e}")
-                    progress.update(task, advance=1)
-
-        self.console.print(
-            f"[green]✓ Extracted probabilities for "
-            f"{len(probability_extractions)} events[/green]"
-        )
-
-        if not probability_extractions:
-            self.console.print(
-                "[yellow]No probability extractions succeeded. "
-                "Check research output formatting and parsing.[/yellow]"
-            )
-
-        return probability_extractions
-
-    # ---------- Market odds ----------
-
-    async def get_market_odds(
-        self, event_markets: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
-        """Fetch current market odds for all markets."""
-        self.console.print(
-            f"\n[bold]Step 4: Fetching current market odds...[/bold]"
-        )
-
-        market_odds: Dict[str, Dict[str, Any]] = {}
-        all_tickers: List[str] = []
-
-        for _, data in event_markets.items():
-            for market in data["markets"]:
-                ticker = market.get("ticker", "")
-                if ticker:
-                    all_tickers.append(ticker)
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            task = progress.add_task(
-                "Fetching market odds...", total=len(all_tickers)
-            )
-
-            batch_size = 20
-            for i in range(0, len(all_tickers), batch_size):
-                batch = all_tickers[i : i + batch_size]
-
-                tasks = [
-                    self.kalshi_client.get_market_with_odds(ticker) for ticker in batch
-                ]
-
-                try:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    for ticker, result in zip(batch, results):
-                        if not isinstance(result, Exception) and result:
-                            # Pre-compute mid prices to simplify later logic
-                            yes_bid = result.get("yes_bid", 0)
-                            yes_ask = result.get("yes_ask", 0)
-                            no_bid = result.get("no_bid", 0)
-                            no_ask = result.get("no_ask", 0)
-
-                            def _mid(b: float, a: float) -> Optional[float]:
-                                if b > 0 and a > 0:
-                                    return (b + a) / 2.0
-                                if a > 0:
-                                    return float(a)
-                                if b > 0:
-                                    return float(b)
-                                return None
-
-                            yes_mid = _mid(yes_bid, yes_ask)
-                            no_mid = _mid(no_bid, no_ask)
-
-                            result["yes_mid_price"] = yes_mid
-                            result["no_mid_price"] = no_mid
-
-                            market_odds[ticker] = result
-                            progress.update(task, advance=1)
-                        else:
-                            self.console.print(
-                                f"[red]✗ Failed to get odds for {ticker}[/red]"
-                            )
-                            progress.update(task, advance=1)
-                except Exception as e:
-                    self.console.print(f"[red]Batch odds fetch error: {e}[/red]")
-                    progress.update(task, advance=len(batch))
-
-                await asyncio.sleep(0.2)
-
-        self.console.print(
-            f"[green]✓ Fetched odds for {len(market_odds)} markets[/green]"
-        )
-        return market_odds
-
-    # ---------- Betting decision engine ----------
-
-    async def _get_event_betting_decisions(
-        self,
-        event_ticker: str,
-        event_data: Dict[str, Any],
-        probability_extraction: ProbabilityExtraction,
-        market_odds: Dict[str, Dict[str, Any]],
-    ) -> MarketAnalysis:
-        """
-        Deterministic decision engine that converts probabilities + odds into
-        a MarketAnalysis, with configurable risk controls.
-        """
-        try:
-            event_info = event_data["event"]
-            markets = event_data["markets"]
-
-            markets_by_ticker = {m.get("ticker", ""): m for m in markets}
-            z_threshold = float(getattr(self.config, "z_threshold", 1.5))
-            min_conf_to_bet = float(getattr(self.config, "min_confidence_to_bet", 0.7))
-            min_edge_points = float(getattr(self.config, "min_edge_points", 10.0))
-
-            decisions: List[BettingDecision] = []
-            total_bet = 0.0
-            high_conf_count = 0
-
-            for mp in probability_extraction.markets:
-                ticker = mp.ticker
-                if ticker not in markets_by_ticker:
-                    continue
-
-                odds = market_odds.get(ticker, {})
-                yes_mid_cents = odds.get("yes_mid_price")
-                if yes_mid_cents is None or yes_mid_cents <= 0:
-                    logger.info(
-                        f"Skipping {ticker}: invalid yes_mid_price={yes_mid_cents}"
-                    )
-                    continue
-
-                market_prob = yes_mid_cents / 100.0
-                research_prob = float(mp.research_probability) / 100.0
-
-                edge_points = (research_prob - market_prob) * 100.0
-                if edge_points < min_edge_points:
-                    logger.info(
-                        f"Skipping {ticker}: edge {edge_points:.1f} < "
-                        f"min_edge_points {min_edge_points:.1f}"
-                    )
-                    continue
-
-                metrics = self.calculate_risk_adjusted_metrics(
-                    research_prob, market_prob, "buy_yes"
-                )
-                r_score = metrics["r_score"]
-                if r_score < z_threshold:
-                    logger.info(
-                        f"Skipping {ticker}: R-score {r_score:.2f} < "
-                        f"z_threshold {z_threshold:.2f}"
-                    )
-                    continue
-
-                # Base confidence from extraction or derived from R-score
-                if mp.confidence is not None:
-                    confidence = float(mp.confidence)
-                else:
-                    confidence = 0.6 + max(0.0, min(0.35, (r_score - z_threshold) / 5.0))
-
-                if confidence < min_conf_to_bet:
-                    logger.info(
-                        f"Skipping {ticker}: confidence {confidence:.2f} < "
-                        f"min_conf_to_bet {min_conf_to_bet:.2f}"
-                    )
-                    continue
-
-                # Position sizing
-                if self.config.enable_kelly_sizing:
-                    kelly_size = self.calculate_kelly_position_size(
-                        metrics["kelly_fraction"]
-                    )
-                    amount = min(kelly_size, float(self.config.max_bet_amount))
-                else:
-                    amount = float(self.config.max_bet_amount)
-
-                amount = max(1.0, amount)
-
-                market_info = markets_by_ticker[ticker]
-                event_title = event_info.get("title", "")
-                market_title = market_info.get("title", "")
-
-                reasoning = (
-                    f"Positive edge: research {research_prob*100:.1f}% vs market "
-                    f"{market_prob*100:.1f}% (edge {edge_points:.1f} pts, "
-                    f"R-score {r_score:.2f})."
-                )
-
-                decision = BettingDecision(
-                    ticker=ticker,
-                    action="buy_yes",
-                    confidence=confidence,
-                    amount=amount,
-                    reasoning=reasoning,
-                    event_name=event_title,
-                    market_name=market_title,
-                    expected_return=metrics["expected_return"],
-                    r_score=metrics["r_score"],
-                    kelly_fraction=metrics["kelly_fraction"],
-                    market_price=market_prob,
-                    research_probability=research_prob,
-                    is_hedge=False,
-                    hedge_for=None,
-                    hedge_ratio=None,
-                )
-
-                decisions.append(decision)
-                total_bet += amount
-                if confidence >= 0.8:
-                    high_conf_count += 1
-
-            if not decisions:
-                return MarketAnalysis(
-                    decisions=[],
-                    total_recommended_bet=0.0,
-                    high_confidence_bets=0,
-                    summary=f"No actionable edges detected for event {event_ticker}.",
-                )
-
-            analysis = MarketAnalysis(
-                decisions=decisions,
-                total_recommended_bet=float(total_bet),
-                high_confidence_bets=high_conf_count,
-                summary=(
-                    f"Generated {len(decisions)} bets based on edge logic; "
-                    f"total suggested: ${total_bet:.2f}."
-                ),
-            )
-
-            # Portfolio selection within event
-            analysis = self.apply_portfolio_selection(analysis, event_ticker)
-
-            return analysis
-        except Exception as e:
-            logger.error(f"Error generating decisions for {event_ticker}: {e}")
-            return MarketAnalysis(
-                decisions=[],
-                total_recommended_bet=0.0,
-                high_confidence_bets=0,
-                summary=f"Error generating decisions for {event_ticker}",
-            )
-
-    async def _get_betting_decisions_for_event(
-        self,
-        event_ticker: str,
-        event_data: Dict[str, Any],
-        extraction: ProbabilityExtraction,
-        market_odds: Dict[str, Dict[str, Any]],
-    ) -> Tuple[str, Optional[MarketAnalysis]]:
-        """
-        Wrapper: returns (event_ticker, MarketAnalysis|None) for parallel use.
-        """
-        try:
-            analysis = await self._get_event_betting_decisions(
-                event_ticker, event_data, extraction, market_odds
-            )
-            return event_ticker, analysis
-        except Exception as e:
-            logger.error(
-                f"Error in _get_betting_decisions_for_event({event_ticker}): {e}"
-            )
-            return event_ticker, None
-
-    # ---------- Display helpers ----------
-
-    def _generate_readable_market_name(self, ticker: str) -> str:
-        """Generate a readable market name from ticker."""
-        return ticker.replace("-", " ").replace("_", " ").title()
-
-    def _display_event_decisions(
-        self, event_ticker: str, event_analysis: MarketAnalysis
-    ):
-        """Display the betting decisions for a single event."""
-        actionable_decisions = [
-            d for d in event_analysis.decisions if d.action != "skip"
-        ]
-
-        if not actionable_decisions:
-            self.console.print(f"[yellow]No actionable decisions for {event_ticker}[/yellow]")
-            return
-
-        event_name = actionable_decisions[0].event_name or event_ticker
-        table = Table(title=f"Betting Decisions for {event_name}", show_lines=True)
-        table.add_column("Type", style="bright_blue", justify="center", width=8)
-        table.add_column("Market", style="cyan", width=40)
-        table.add_column("Action", style="yellow", justify="center", width=10)
-        table.add_column("Confidence", style="magenta", justify="right", width=10)
-        table.add_column("Amount", style="green", justify="right", width=10)
-        table.add_column("Reasoning", style="blue", width=70)
-
-        for decision in actionable_decisions:
-            market_display = (
-                decision.market_name
-                if decision.market_name
-                else self._generate_readable_market_name(decision.ticker)
-            )
-            bet_type = "🛡️ Hedge" if decision.is_hedge else "💰 Main"
-
-            table.add_row(
-                bet_type,
-                market_display,
-                decision.action.upper().replace("_", " "),
-                f"{decision.confidence:.2f}",
-                f"${decision.amount:.2f}",
-                decision.reasoning,
-            )
-
-        self.console.print(table)
-
-        if event_analysis.total_recommended_bet > 0:
-            self.console.print(
-                f"[blue]Event total: ${event_analysis.total_recommended_bet:.2f} | "
-                f"High confidence: {event_analysis.high_confidence_bets}[/blue]"
-            )
-
-    # ---------- Hedging + global decision aggregation ----------
-
-    def _generate_hedge_decisions(
-        self, main_decisions: List[BettingDecision]
-    ) -> List[BettingDecision]:
-        """Generate hedge decisions to minimize risk for main betting decisions."""
-        if not self.config.enable_hedging:
-            return []
-
-        hedge_decisions: List[BettingDecision] = []
-        min_conf_for_hedge = float(
-            getattr(self.config, "min_confidence_for_hedging", 0.75)
-        )
-
-        for main_decision in main_decisions:
-            if main_decision.is_hedge or main_decision.action == "skip":
-                continue
-
-            if main_decision.confidence >= min_conf_for_hedge:
-                continue
-
-            hedge_amount = min(
-                main_decision.amount * float(self.config.hedge_ratio),
-                float(self.config.max_hedge_amount),
-            )
-            if hedge_amount < 1.0:
-                continue
-
-            hedge_action = (
-                "buy_no" if main_decision.action == "buy_yes" else "buy_yes"
-            )
-
-            hedge_decision = BettingDecision(
-                ticker=main_decision.ticker,
-                action=hedge_action,
-                confidence=0.8,
-                amount=float(hedge_amount),
-                reasoning=(
-                    f"Risk hedge: {float(self.config.hedge_ratio)*100:.0f}% hedge for "
-                    f"{main_decision.action} (confidence "
-                    f"{main_decision.confidence:.2f} < {min_conf_for_hedge:.2f})"
-                ),
-                event_name=main_decision.event_name,
-                market_name=main_decision.market_name,
-                is_hedge=True,
-                hedge_for=main_decision.ticker,
-                hedge_ratio=float(self.config.hedge_ratio),
-            )
-
-            hedge_decisions.append(hedge_decision)
-
-        return hedge_decisions
-
-    async def get_betting_decisions(
-        self,
-        event_markets: Dict[str, Dict[str, Any]],
-        probability_extractions: Dict[str, ProbabilityExtraction],
-        market_odds: Dict[str, Dict[str, Any]],
-    ) -> MarketAnalysis:
-        """Generate betting decisions per event in parallel."""
-        self.console.print(
-            f"\n[bold]Step 5: Generating betting decisions...[/bold]"
-        )
-
-        all_decisions: List[BettingDecision] = []
-        total_recommended_bet = 0.0
-        high_confidence_bets = 0
-        event_summaries: List[str] = []
-
-        processable_events = [
-            (event_ticker, data)
-            for event_ticker, data in event_markets.items()
-            if event_ticker in probability_extractions and data["markets"]
-        ]
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            task = progress.add_task(
-                "Generating betting decisions...", total=len(processable_events)
-            )
-
-            tasks = []
-            for event_ticker, data in processable_events:
-                tasks.append(
-                    self._get_betting_decisions_for_event(
-                        event_ticker,
-                        data,
-                        probability_extractions[event_ticker],
-                        market_odds,
-                    )
-                )
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(
-                        f"Exception in betting decisions generation: {result}"
-                    )
-                    progress.update(task, advance=1)
-                    continue
-
-                event_ticker, event_analysis = result
-                if event_analysis is not None:
-                    self._display_event_decisions(event_ticker, event_analysis)
-
-                    all_decisions.extend(event_analysis.decisions)
-                    total_recommended_bet += event_analysis.total_recommended_bet
-                    high_confidence_bets += event_analysis.high_confidence_bets
-                    event_summaries.append(
-                        f"{event_ticker}: {event_analysis.summary}"
-                    )
-
-                    self.console.print(
-                        f"[green]✓ Generated {len(event_analysis.decisions)} "
-                        f"decisions for {event_ticker}[/green]"
-                    )
-                else:
-                    self.console.print(
-                        f"[red]✗ Failed to generate decisions for "
-                        f"{event_ticker}[/red]"
-                    )
-
-                progress.update(task, advance=1)
-
-        hedge_decisions = self._generate_hedge_decisions(all_decisions)
-        if hedge_decisions:
-            all_decisions.extend(hedge_decisions)
-            hedge_bet_total = sum(d.amount for d in hedge_decisions)
-            total_recommended_bet += hedge_bet_total
-            self.console.print(
-                f"[blue]💡 Generated {len(hedge_decisions)} hedge bets "
-                f"(${hedge_bet_total:.2f}) for risk management[/blue]"
-            )
-
-        analysis = MarketAnalysis(
-            decisions=all_decisions,
-            total_recommended_bet=float(total_recommended_bet),
-            high_confidence_bets=high_confidence_bets,
-            summary=(
-                f"Analyzed {len(processable_events)} events. "
-                + " | ".join(event_summaries[:3])
-                + (
-                    f" and {len(event_summaries) - 3} more..."
-                    if len(event_summaries) > 3
-                    else ""
-                )
-            ),
-        )
-
-        actionable_decisions = [d for d in analysis.decisions if d.action != "skip"]
-        self.console.print(
-            f"\n[green]✓ Generated {len(analysis.decisions)} total decisions "
-            f"({len(actionable_decisions)} actionable)[/green]"
-        )
-
-        if actionable_decisions:
-            table = Table(title="📊 All Betting Decisions Summary", show_lines=True)
-            table.add_column("Type", style="bright_blue", justify="center", width=8)
-            table.add_column("Event", style="bright_blue", width=22)
-            table.add_column("Market", style="cyan", width=32)
-            table.add_column("Action", style="yellow", justify="center", width=10)
-            table.add_column("Confidence", style="magenta", justify="right", width=10)
-            table.add_column("Amount", style="green", justify="right", width=10)
-            table.add_column("Reasoning", style="blue", width=65)
-
-            for decision in actionable_decisions:
-                event_name = decision.event_name or "Unknown Event"
-                market_name = decision.market_name or decision.ticker
-                bet_type = "🛡️ Hedge" if decision.is_hedge else "💰 Main"
-
-                table.add_row(
-                    bet_type,
-                    event_name,
-                    market_name,
-                    decision.action.upper().replace("_", " "),
-                    f"{decision.confidence:.2f}",
-                    f"${decision.amount:.2f}",
-                    decision.reasoning,
-                )
-
-            self.console.print(table)
+                self.perplexity_enabled = True
+                console.print("[bold green]✓ Perplexity API enabled and ready[/bold green]")
+                console.print(f"[dim]  Model: {config.perplexity.model}[/dim]")
+                console.print(f"[dim]  API Key: {'*' * 8}{config.perplexity.api_key[-8:]}[/dim]")
+                logger.warning("PERPLEXITY INITIALIZED: Ready to make API calls")
+            except Exception as e:
+                console.print(f"[red]✗ Perplexity initialization failed: {e}[/red]")
+                logger.warning(f"PERPLEXITY INIT ERROR: {type(e).__name__}: {e}")
+                self.perplexity_enabled = False
+                self.perplexity_client = None
         else:
-            self.console.print(
-                "[yellow]No actionable betting decisions generated[/yellow]"
-            )
-
-        self.console.print(
-            f"\n[blue]Total recommended bet: ${analysis.total_recommended_bet:.2f}[/blue]"
+            console.print("[yellow]⚠️  Perplexity not configured[/yellow]")
+            if not config.perplexity.api_key:
+                console.print("[dim]  Reason: No API key in .env[/dim]")
+                logger.warning("PERPLEXITY DISABLED: No API key")
+            elif not config.perplexity.enabled:
+                console.print("[dim]  Reason: Disabled in configuration[/dim]")
+                logger.warning("PERPLEXITY DISABLED: Not enabled in config")
+        
+        # Risk management - FIXED INITIALIZATION
+        self.capital_manager = CapitalManager(
+            self.kalshi_client,
+            max_position_pct=0.02,  # 2% max per position
+            max_event_pct=0.05,     # 5% max per event
+            max_total_deployed_pct=0.30,  # 30% max deployed (conservative)
         )
-        self.console.print(
-            f"[blue]High confidence bets: {analysis.high_confidence_bets}[/blue]"
+        self.position_manager = PositionManager(
+            kalshi_client=self.kalshi_client,
+            research_client=self.research_client,
+            openai_client=self.openai_client,
+            config=config,
         )
-        self.console.print(f"[blue]Strategy: {analysis.summary}[/blue]")
-
-        return analysis
-
-    # ---------- Execution + CSV logging ----------
-
-    async def place_bets(
+        
+        # Intelligence components
+        self.efficiency_filter = MarketEfficiencyFilter()
+        self.research_scorer = ResearchQualityScorer()
+        self.mispricing_analyzer = MispricingAnalyzer()
+        self.correlation_analyzer = CorrelationAnalyzer()
+        self.adverse_selection_filter = AdverseSelectionFilter()
+        
+        # State tracking
+        self.decisions_log: List[BettingDecision] = []
+        self.research_cache: Dict[str, Tuple[str, datetime]] = {}
+        self.daily_positions_taken = 0
+        self.last_reset_date = datetime.now(timezone.utc).date()
+        
+        # INSTITUTIONAL GRADE THRESHOLDS (relaxed for demo environment)
+        self.MIN_EDGE_PCT = 5.0               # 5% edge minimum (demo)
+        self.MIN_R_SCORE = 0.3                # 0.3 standard deviations (very permissive)
+        self.MIN_CONFIDENCE = 0.55            # 55% confidence (demo)
+        self.MIN_RESEARCH_QUALITY = 4.0       # 4/10 research quality (demo)
+        self.MIN_INEFFICIENCY_SCORE = 2.0     # 2/10 inefficiency score (very permissive)
+        self.MIN_MISPRICING_CONVICTION = 4.0  # 4/10 mispricing conviction (demo)
+        
+        # Dynamic limits (quality-based, not hard caps)
+        self.MAX_POSITIONS_EXCELLENT = 5      # Up to 5 if all excellent (>8.5/10)
+        self.MAX_POSITIONS_GOOD = 3           # Up to 3 if good (7-8.5/10)
+        self.MAX_POSITIONS_OK = 1             # Only 1 if merely OK (6-7/10)
+        
+        # Position sizing
+        self.BASE_KELLY_FRACTION = 0.25       # Quarter Kelly (conservative)
+        self.MAX_POSITION_SIZE_PCT = 0.02     # 2% of bankroll max
+        
+    def _reset_daily_limits(self):
+        """Reset daily counters if it's a new day."""
+        today = datetime.now(timezone.utc).date()
+        if today > self.last_reset_date:
+            self.daily_positions_taken = 0
+            self.last_reset_date = today
+            logger.info(f"Reset daily position counter for {today}")
+    
+    def _calculate_quality_score(
         self,
-        analysis: MarketAnalysis,
-        market_odds: Dict[str, Dict[str, Any]],
-        probability_extractions: Dict[str, ProbabilityExtraction],
-    ):
-        """Place bets based on the analysis."""
-        self.console.print(f"\n[bold]Step 6: Placing bets...[/bold]")
-
-        if not analysis.decisions:
-            self.console.print("[yellow]No betting decisions to execute[/yellow]")
-            return
-
-        actionable_decisions = [d for d in analysis.decisions if d.action != "skip"]
-        if not actionable_decisions:
-            self.console.print(
-                "[yellow]No actionable betting decisions to execute[/yellow]"
-            )
-            return
-
-        self.console.print(
-            f"Found {len(actionable_decisions)} actionable decisions"
+        inefficiency_score: float,
+        research_quality: float,
+        mispricing_conviction: float,
+        edge_pct: float,
+        r_score: float,
+    ) -> float:
+        """
+        Calculate overall quality score for a potential trade.
+        
+        Returns:
+            Quality score 0-10
+        """
+        # Weighted average of components
+        quality = (
+            inefficiency_score * 0.20 +
+            research_quality * 0.25 +
+            mispricing_conviction * 0.30 +
+            min(edge_pct / 20.0 * 10, 10) * 0.15 +  # Edge normalized to 10
+            min(r_score / 3.0 * 10, 10) * 0.10      # R-score normalized to 10
         )
-
-        for decision in actionable_decisions:
-            if self.config.dry_run:
-                self.console.print(
-                    f"[blue]DRY RUN: Would place {decision.action} bet of "
-                    f"${decision.amount} on {decision.ticker}[/blue]"
-                )
-            else:
-                side = "yes" if decision.action == "buy_yes" else "no"
-                result = await self.kalshi_client.place_order(
-                    decision.ticker, side, decision.amount
-                )
-
-                if result.get("success"):
-                    self.console.print(
-                        f"[green]✓ Placed {decision.action} bet of "
-                        f"${decision.amount} on {decision.ticker}[/green]"
-                    )
-                else:
-                    self.console.print(
-                        f"[red]✗ Failed to place bet on {decision.ticker}: "
-                        f"{result.get('error', 'Unknown error')}[/red]"
-                    )
-
-        if self.config.dry_run:
-            self.console.print(
-                "\n[yellow]DRY RUN MODE: No actual bets were placed[/yellow]"
-            )
+        
+        return min(10, quality)
+    
+    def _get_max_positions_for_quality(self, quality_score: float) -> int:
+        """Determine max positions based on trade quality."""
+        if quality_score >= 8.5:
+            return self.MAX_POSITIONS_EXCELLENT
+        elif quality_score >= 7.0:
+            return self.MAX_POSITIONS_GOOD
+        elif quality_score >= 6.0:
+            return self.MAX_POSITIONS_OK
         else:
-            self.console.print(f"\n[green]✓ Completed bet placement[/green]")
-
-    def save_betting_decisions_to_csv(
-        self,
-        analysis: MarketAnalysis,
-        research_results: Dict[str, str],
-        probability_extractions: Dict[str, ProbabilityExtraction],
-        market_odds: Dict[str, Dict[str, Any]],
-        event_markets: Dict[str, Dict[str, Any]],
-    ) -> str:
-        """
-        Save betting decisions to a timestamped CSV file including raw research data.
-        """
-        output_dir = Path("betting_decisions")
-        output_dir.mkdir(exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"betting_decisions_{timestamp}.csv"
-        filepath = output_dir / filename
-
-        csv_data: List[Dict[str, Any]] = []
-
-        for decision in analysis.decisions:
-            event_ticker = None
-            raw_research = ""
-            research_summary = ""
-            research_probability = None
-            research_reasoning = ""
-            market_yes_price = None
-            market_no_price = None
-            market_yes_mid = None
-            market_no_mid = None
-            event_title = ""
-            market_title = ""
-
-            for evt_ticker, data in event_markets.items():
-                for market in data["markets"]:
-                    if market.get("ticker") == decision.ticker:
-                        event_ticker = evt_ticker
-                        event_title = data["event"].get("title", "")
-                        market_title = market.get("title", "")
-                        break
-                if event_ticker:
-                    break
-
-            if event_ticker and event_ticker in research_results:
-                raw_research = research_results[event_ticker]
-
-            if event_ticker and event_ticker in probability_extractions:
-                extraction = probability_extractions[event_ticker]
-                research_summary = extraction.overall_summary
-                for market_prob in extraction.markets:
-                    if market_prob.ticker == decision.ticker:
-                        research_probability = market_prob.research_probability
-                        research_reasoning = market_prob.reasoning
-                        break
-
-            if decision.ticker in market_odds:
-                odds = market_odds[decision.ticker]
-                yes_bid = odds.get("yes_bid", 0)
-                no_bid = odds.get("no_bid", 0)
-                yes_ask = odds.get("yes_ask", 0)
-                no_ask = odds.get("no_ask", 0)
-
-                has_yes_side = (yes_bid > 0) or (yes_ask > 0)
-                has_no_side = (no_bid > 0) or (no_ask > 0)
-                if not (has_yes_side and has_no_side):
-                    continue
-
-                market_yes_price = yes_ask if yes_ask > 0 else None
-                market_no_price = no_ask if no_ask > 0 else None
-
-                if yes_bid > 0 and yes_ask > 0:
-                    market_yes_mid = (yes_bid + yes_ask) / 2.0
-                if no_bid > 0 and no_ask > 0:
-                    market_no_mid = (no_bid + no_ask) / 2.0
-
-            if (market_yes_price is None or market_yes_price == 0) or (
-                market_no_price is None or market_no_price == 0
-            ):
-                continue
-
-            csv_row: Dict[str, Any] = {
-                "timestamp": datetime.now().isoformat(),
-                "event_ticker": event_ticker or "",
-                "event_title": event_title,
-                "market_ticker": decision.ticker,
-                "market_title": market_title,
-                "action": decision.action,
-                "bet_amount": decision.amount,
-                "confidence": decision.confidence,
-                "reasoning": decision.reasoning,
-                "research_probability": research_probability,
-                "research_reasoning": research_reasoning,
-                "market_yes_price": market_yes_price,
-                "market_no_price": market_no_price,
-                "market_yes_mid": market_yes_mid,
-                "market_no_mid": market_no_mid,
-                "expected_return": getattr(decision, "expected_return", None),
-                "r_score": getattr(decision, "r_score", None),
-                "kelly_fraction": getattr(decision, "kelly_fraction", None),
-                "calc_market_prob": getattr(decision, "market_price", None),
-                "calc_research_prob": getattr(decision, "research_probability", None),
-                "is_hedge": getattr(decision, "is_hedge", False),
-                "hedge_for": getattr(decision, "hedge_for", "") or "",
-                "research_summary": research_summary,
-                "raw_research": raw_research.replace("\n", " ").replace("\r", " ")
-                if raw_research
-                else "",
-            }
-
-            market_enriched: Dict[str, Any] = {}
-            if decision.ticker in market_odds:
-                m = market_odds[decision.ticker]
-                market_enriched["market_title_full"] = m.get("title")
-                market_enriched["market_subtitle"] = m.get("subtitle")
-                market_enriched["market_yes_sub_title"] = m.get("yes_sub_title")
-                market_enriched["market_no_sub_title"] = m.get("no_sub_title")
-
-                market_enriched.update(
-                    {
-                        "market_event_ticker": m.get("event_ticker"),
-                        "market_market_type": m.get("market_type"),
-                        "market_open_time": m.get("open_time"),
-                        "market_close_time": m.get("close_time"),
-                        "market_expiration_time": m.get("expiration_time"),
-                        "market_latest_expiration_time": m.get("latest_expiration_time"),
-                        "market_settlement_timer_seconds": m.get(
-                            "settlement_timer_seconds"
-                        ),
-                        "market_status": m.get("status"),
-                        "market_response_price_units": m.get("response_price_units"),
-                        "market_notional_value": m.get("notional_value"),
-                        "market_tick_size": m.get("tick_size"),
-                        "market_yes_bid": m.get("yes_bid"),
-                        "market_yes_ask": m.get("yes_ask"),
-                        "market_no_bid": m.get("no_bid"),
-                        "market_no_ask": m.get("no_ask"),
-                        "market_last_price": m.get("last_price"),
-                        "market_previous_yes_bid": m.get("previous_yes_bid"),
-                        "market_previous_yes_ask": m.get("previous_yes_ask"),
-                        "market_previous_price": m.get("previous_price"),
-                        "market_volume": m.get("volume"),
-                        "market_volume_24h": m.get("volume_24h"),
-                        "market_liquidity": m.get("liquidity"),
-                        "market_open_interest": m.get("open_interest"),
-                        "market_result": m.get("result"),
-                        "market_can_close_early": m.get("can_close_early"),
-                        "market_expiration_value": m.get("expiration_value"),
-                        "market_category": m.get("category"),
-                        "market_risk_limit_cents": m.get("risk_limit_cents"),
-                        "market_rules_primary": m.get("rules_primary"),
-                        "market_rules_secondary": m.get("rules_secondary"),
-                        "market_settlement_value": m.get("settlement_value"),
-                        "market_settlement_value_dollars": m.get(
-                            "settlement_value_dollars"
-                        ),
-                    }
-                )
-
-            csv_row.update(market_enriched)
-            csv_data.append(csv_row)
-
-        if csv_data:
-            fieldnames = [
-                "timestamp",
-                "event_ticker",
-                "event_title",
-                "market_ticker",
-                "market_title",
-                "action",
-                "bet_amount",
-                "confidence",
-                "reasoning",
-                "research_probability",
-                "research_reasoning",
-                "market_yes_price",
-                "market_no_price",
-                "market_yes_mid",
-                "market_no_mid",
-                "expected_return",
-                "r_score",
-                "kelly_fraction",
-                "calc_market_prob",
-                "calc_research_prob",
-                "is_hedge",
-                "hedge_for",
-                "research_summary",
-                "raw_research",
-            ]
-
-            additional_market_fields = [
-                "market_title_full",
-                "market_subtitle",
-                "market_yes_sub_title",
-                "market_no_sub_title",
-                "market_event_ticker",
-                "market_market_type",
-                "market_open_time",
-                "market_close_time",
-                "market_expiration_time",
-                "market_latest_expiration_time",
-                "market_settlement_timer_seconds",
-                "market_status",
-                "market_response_price_units",
-                "market_notional_value",
-                "market_tick_size",
-                "market_yes_bid",
-                "market_yes_ask",
-                "market_no_bid",
-                "market_no_ask",
-                "market_last_price",
-                "market_previous_yes_bid",
-                "market_previous_yes_ask",
-                "market_previous_price",
-                "market_volume",
-                "market_volume_24h",
-                "market_liquidity",
-                "market_open_interest",
-                "market_result",
-                "market_can_close_early",
-                "market_expiration_value",
-                "market_category",
-                "market_risk_limit_cents",
-                "market_rules_primary",
-                "market_rules_secondary",
-                "market_settlement_value",
-                "market_settlement_value_dollars",
-            ]
-
-            base_set = set(fieldnames)
-            present_keys = set()
-            for row in csv_data:
-                for k in row.keys():
-                    if k not in base_set:
-                        present_keys.add(k)
-
-            ordered_extras = [f for f in additional_market_fields if f in present_keys]
-            remaining_extras = sorted(
-                k for k in present_keys if k not in set(ordered_extras)
-            )
-            fieldnames.extend(ordered_extras + remaining_extras)
-
-            with open(filepath, "w", newline="", encoding="utf-8") as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(csv_data)
-
-            logger.info(f"Saved {len(csv_data)} betting decisions to {filepath}")
-            self.console.print(
-                f"[bold green]✓[/bold green] Betting decisions saved to: [blue]{filepath}[/blue]"
-            )
-        else:
-            logger.warning("No betting decisions to save")
-            self.console.print("[yellow]No betting decisions to save[/yellow]")
-
-        return str(filepath)
-
-    # ---------- Main run loop ----------
+            return 0  # Don't trade if quality too low
+    
+    def print_config_summary(self):
+        """Print configuration summary banner."""
+        mode_color = "red" if not self.config.dry_run else "green"
+        mode_text = "LIVE TRADING" if not self.config.dry_run else "DRY RUN"
+        
+        console.print("\n" + "="*70, style="bold blue")
+        console.print("🏛️  KALSHI INSTITUTIONAL TRADING BOT", style="bold white", justify="center")
+        console.print("="*70 + "\n", style="bold blue")
+        
+        # Create config table
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Setting", style="cyan", width=30)
+        table.add_column("Value", style="white")
+        
+        table.add_row("Environment", "PRODUCTION" if not self.config.kalshi.use_demo else "DEMO")
+        table.add_row("Mode", Text(mode_text, style=mode_color))
+        table.add_row("", "")
+        table.add_row("Strategy", "Institutional Grade - Ultra Selective")
+        table.add_row("Research Method", "Dual Source (Octagon + Perplexity)" if self.perplexity_client else "Single Source (Octagon)")
+        table.add_row("", "")
+        table.add_row("📊 Minimum Thresholds:", "")
+        table.add_row("  • Edge Required", f"{self.MIN_EDGE_PCT}% ({self.MIN_R_SCORE}σ)")
+        table.add_row("  • Confidence", f"{self.MIN_CONFIDENCE*100:.0f}%")
+        table.add_row("  • Research Quality", f"{self.MIN_RESEARCH_QUALITY}/10")
+        table.add_row("  • Inefficiency Score", f"{self.MIN_INEFFICIENCY_SCORE}/10")
+        table.add_row("  • Mispricing Conviction", f"{self.MIN_MISPRICING_CONVICTION}/10")
+        table.add_row("", "")
+        table.add_row("💰 Position Sizing:", "")
+        table.add_row("  • Max Per Position", f"{self.MAX_POSITION_SIZE_PCT*100}% of bankroll")
+        table.add_row("  • Kelly Fraction", f"{self.BASE_KELLY_FRACTION*100:.0f}%")
+        table.add_row("", "")
+        table.add_row("📈 Dynamic Limits:", "")
+        table.add_row("  • Excellent Trades (8.5+)", f"Up to {self.MAX_POSITIONS_EXCELLENT} positions")
+        table.add_row("  • Good Trades (7-8.5)", f"Up to {self.MAX_POSITIONS_GOOD} positions")
+        table.add_row("  • OK Trades (6-7)", f"Up to {self.MAX_POSITIONS_OK} position")
+        
+        console.print(table)
+        console.print()
 
     async def run(self):
-        """Main bot execution."""
+        """Main bot execution flow."""
         try:
-            await self.initialize()
+            self.print_config_summary()
+            
+            # Reset daily limits
+            self._reset_daily_limits()
 
-            events = await self.get_top_events()
-            if not events:
-                self.console.print("[red]No events found. Exiting.[/red]")
+            # Initialize Kalshi client
+            await self.kalshi_client.login()
+            
+            # Refresh capital state with progress
+            console.print("💰 [bold cyan]Refreshing capital state...[/bold cyan]")
+            
+            auth_failed = False
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=console,
+                    transient=True,
+                ) as progress:
+                    task = progress.add_task("Loading capital info...", total=None)
+                    await self.capital_manager.refresh_capital_state()
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    auth_failed = True
+                    console.print("[yellow]⚠️  Authentication issue detected[/yellow]")
+                    console.print("[dim]Running in limited mode (no portfolio data)[/dim]")
+                else:
+                    raise
+            
+            if not auth_failed:
+                console.print(self.capital_manager.get_position_summary())
+            else:
+                console.print("\n[dim]Capital state unavailable - proceeding with market analysis[/dim]\n")
+            
+            # Check existing positions with progress
+            if not auth_failed:
+                console.print("🔍 [bold cyan]Evaluating existing positions...[/bold cyan]")
+                try:
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        console=console,
+                        transient=True,
+                    ) as progress:
+                        task = progress.add_task("Analyzing positions...", total=None)
+                        exit_signals = await self.position_manager.evaluate_all_positions()
+                    
+                    if exit_signals:
+                        console.print(f"\n⚠️  [yellow]Found {len(exit_signals)} exit signals[/yellow]\n")
+                        await self._handle_exit_signals(exit_signals)
+                    else:
+                        console.print("[green]✓ All positions look good[/green]\n")
+                except:
+                    console.print("[dim]Position evaluation unavailable[/dim]\n")
+            
+            # Find new opportunities with progress
+            console.print("🔎 [bold cyan]Scanning for new opportunities...[/bold cyan]")
+            opportunities = await self._scan_for_opportunities()
+            
+            if not opportunities:
+                console.print("\n[yellow]No qualifying opportunities found[/yellow]")
+                console.print("[dim]💤 This is normal - most markets are efficient.[/dim]")
                 return
-
-            event_markets = await self.get_markets_for_events(events)
-            if not event_markets:
-                self.console.print("[red]No markets found. Exiting.[/red]")
-                return
-
-            event_markets = await self.filter_markets_by_positions(event_markets)
-            if not event_markets:
-                self.console.print(
-                    "[red]No markets remaining after position filtering. Exiting.[/red]"
-                )
-                return
-
-            if len(event_markets) > self.config.max_events_to_analyze:
-                filtered_events_list = []
-                for event_ticker, data in event_markets.items():
-                    event = data["event"]
-                    volume_24h = event.get("volume_24h", 0)
-                    filtered_events_list.append((event_ticker, data, volume_24h))
-
-                filtered_events_list.sort(key=lambda x: x[2], reverse=True)
-                top_events = filtered_events_list[: self.config.max_events_to_analyze]
-                event_markets = {et: d for et, d, _ in top_events}
-
-                self.console.print(
-                    f"[blue]• Limited to top {len(event_markets)} events by volume "
-                    f"after position filtering[/blue]"
-                )
-
-            research_results = await self.research_events(event_markets)
-            if not research_results:
-                self.console.print("[red]No research results. Exiting.[/red]")
-                return
-
-            probability_extractions = await self.extract_probabilities(
-                research_results, event_markets
-            )
-            if not probability_extractions:
-                self.console.print(
-                    "[red]No probability extractions. Exiting.[/red]"
-                )
-                return
-
-            market_odds = await self.get_market_odds(event_markets)
-            if not market_odds:
-                self.console.print("[red]No market odds found. Exiting.[/red]")
-                return
-
-            analysis = await self.get_betting_decisions(
-                event_markets, probability_extractions, market_odds
-            )
-
-            self.save_betting_decisions_to_csv(
-                analysis=analysis,
-                research_results=research_results,
-                probability_extractions=probability_extractions,
-                market_odds=market_odds,
-                event_markets=event_markets,
-            )
-
-            await self.place_bets(analysis, market_odds, probability_extractions)
-
-            self.console.print("\n[bold green]Bot execution completed![/bold green]")
+            
+            console.print(f"\n[green]✓ Found {len(opportunities)} potential trades[/green]\n")
+            
+            # Execute trades
+            await self._execute_opportunities(opportunities)
+            
+            console.print("\n" + "="*70)
+            console.print("✓ [green bold]Bot run complete[/green bold]")
+            console.print("="*70 + "\n")
+            
+        except KeyboardInterrupt:
+            console.print("\n[yellow]⚠️  Interrupted by user[/yellow]")
         except Exception as e:
-            self.console.print(f"[red]Bot execution error: {e}[/red]")
-            logger.exception("Bot execution failed")
-        finally:
-            if self.research_client:
-                await self.research_client.close()
-            if self.kalshi_client:
-                await self.kalshi_client.close()
+            error_str = str(e)
+            
+            # Check for common API errors
+            if "502" in error_str or "Bad Gateway" in error_str:
+                console.print("\n[red]❌ Kalshi API Error: 502 Bad Gateway[/red]")
+                console.print("[yellow]This means Kalshi's servers are temporarily down or overloaded.[/yellow]")
+                console.print("[dim]This is NOT a problem with your bot - it's Kalshi's issue.[/dim]")
+                console.print("\n[cyan]What to do:[/cyan]")
+                console.print("  1. Wait 5-10 minutes")
+                console.print("  2. Try running the bot again: [bold]python trading_bot.py[/bold]")
+                console.print("  3. If still failing, check https://status.kalshi.co")
+            elif "503" in error_str or "Service Unavailable" in error_str:
+                console.print("\n[red]❌ Kalshi API Error: 503 Service Unavailable[/red]")
+                console.print("[yellow]Kalshi may be in maintenance mode.[/yellow]")
+                console.print("[dim]Try again in 15-30 minutes.[/dim]")
+            elif "401" in error_str or "Unauthorized" in error_str:
+                console.print("\n[red]❌ Authentication Error[/red]")
+                console.print("[yellow]Your Kalshi API credentials are not working.[/yellow]")
+                console.print("\n[cyan]To fix:[/cyan]")
+                console.print("  1. Run: [bold]python test_auth.py[/bold]")
+                console.print("  2. See: [bold]FIX_AUTH_ERROR.md[/bold] for details")
+            elif "timeout" in error_str.lower():
+                console.print("\n[red]❌ Network Timeout[/red]")
+                console.print("[yellow]Connection to Kalshi timed out.[/yellow]")
+                console.print("[dim]Check your internet connection and try again.[/dim]")
+            else:
+                # Generic error
+                console.print(f"\n[red]❌ Error: {e}[/red]")
+                console.print("[dim]Check the error message above for details.[/dim]")
+    
+    async def _scan_for_opportunities(self) -> List[Dict]:
+        """
+        Scan markets for high-quality opportunities.
+        Returns list of qualified opportunities.
+        """
+        # Get events with retry logic (filter for politics category)
+        all_events = []
+        
+        for attempt in range(3):  # 3 retries
+            try:
+                console.print(f"[dim]Fetching events from Kalshi (attempt {attempt + 1}/3)...[/dim]")
+                all_events = await self.kalshi_client.get_events(limit=100, status="open")
+                break
+            except Exception as e:
+                if "502" in str(e) or "Bad Gateway" in str(e):
+                    console.print(f"[yellow]⚠️  Kalshi API temporarily unavailable (502 error)[/yellow]")
+                    if attempt < 2:  # Not last attempt
+                        wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                        console.print(f"[dim]Retrying in {wait_time} seconds...[/dim]")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        console.print("[red]❌ Kalshi API still unavailable after 3 attempts[/red]")
+                        console.print("[dim]This is a Kalshi server issue, not a bot problem.[/dim]")
+                        console.print("[dim]Try again in a few minutes.[/dim]")
+                        return []
+                elif "503" in str(e) or "Service Unavailable" in str(e):
+                    console.print(f"[yellow]⚠️  Kalshi API maintenance mode[/yellow]")
+                    return []
+                else:
+                    # Other error, re-raise
+                    raise
+        
+        if not all_events:
+            console.print("[yellow]⚠️  No events returned from Kalshi[/yellow]")
+            return []
+        
+        # Filter for political events
+        political_categories = ["politics", "election", "congress", "president", "senate", "house"]
+        events = [
+            e for e in all_events 
+            if any(cat in e.get("category", "").lower() for cat in political_categories)
+        ][:50]  # Limit to 50
+        
+        if not events:
+            console.print("[yellow]⚠️  No political events found[/yellow]")
+            return []
+        
+        console.print(f"[dim]Scanning {len(events)} political events...[/dim]")
+        
+        opportunities = []
+        markets_evaluated = 0
+        markets_qualified = 0
+        markets_researched_count = 0
+        
+        MAX_RESEARCH = 40  # HARD LIMIT: Stop after researching 40 markets
+        MAX_PER_EVENT = 3   # Only research top 3 markets per event
+        
+        # Progress tracking
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,  # Disappears when done
+        ) as progress:
+            task = progress.add_task("Evaluating markets...", total=None)
+            
+            for event in events:
+                if markets_researched_count >= MAX_RESEARCH:
+                    console.print(f"\n[yellow]⚠️  Researched {MAX_RESEARCH} markets - stopping to save time[/yellow]")
+                    break
+                
+                try:
+                    # Get markets for this event
+                    markets = await self.kalshi_client.get_markets_for_event(
+                        event.get('event_ticker', ''),
+                    )
+                    
+                    if not markets:
+                        continue
+                    
+                    # SMART SORTING: Prioritize markets likely to be mispriced
+                    # NOT just high volume (those are efficient!)
+                    def mispricing_potential(m):
+                        volume = m.get('volume_24h', 0)
+                        
+                        # Get spread if available
+                        yes_ask = m.get('yes_ask', 50)
+                        yes_bid = m.get('yes_bid', 50)
+                        spread = yes_ask - yes_bid
+                        
+                        score = 0
+                        
+                        # Wide spread = disagreement = opportunity
+                        if spread >= 6:
+                            score += 30
+                        elif spread >= 4:
+                            score += 20
+                        elif spread >= 2:
+                            score += 10
+                        
+                        # Medium volume sweet spot (not too dead, not too efficient)
+                        if 50 <= volume <= 5000:
+                            score += 25  # Sweet spot!
+                        elif 10 <= volume < 50:
+                            score += 15  # Low but tradeable
+                        elif volume > 5000:
+                            score += 5   # High volume = efficient
+                        
+                        # Add some volume so we can trade
+                        score += min(volume / 100, 10)  # Up to +10 for liquidity
+                        
+                        return score
+                    
+                    # Sort by mispricing potential (not just volume!)
+                    markets_sorted = sorted(markets, key=mispricing_potential, reverse=True)
+                    
+                    # Only take top markets per event
+                    markets_to_check = markets_sorted[:MAX_PER_EVENT]
+                    
+                    # Evaluate each market
+                    event_researched = 0
+                    for market in markets_to_check:
+                        if markets_researched_count >= MAX_RESEARCH:
+                            break
+                        
+                        markets_evaluated += 1
+                        
+                        # Check if in cache (won't need research)
+                        ticker = market.get('ticker', '')
+                        needs_research = ticker not in self.research_cache
+                        
+                        if needs_research and event_researched >= MAX_PER_EVENT:
+                            continue  # Skip to next event after max per event
+                        
+                        progress.update(task, description=f"Evaluated {markets_evaluated} (researched {markets_researched_count}/{MAX_RESEARCH}), found {markets_qualified}...")
+                        
+                        opp = await self._evaluate_market(event, market)
+                        
+                        if needs_research:
+                            markets_researched_count += 1
+                            event_researched += 1
+                        
+                        if opp:
+                            opportunities.append(opp)
+                            markets_qualified += 1
+                            console.print(f"[green]✓ Found: {ticker} (Quality: {opp['quality_score']:.1f}/10)[/green]")
+                    
+                except Exception as e:
+                    continue
+        
+        console.print(f"[dim]Evaluated {markets_evaluated} markets total[/dim]")
+        
+        # Sort by quality score (descending)
+        opportunities.sort(key=lambda x: x['quality_score'], reverse=True)
+        
+        return opportunities
+    
+    async def _evaluate_market(
+        self, 
+        event: Dict, 
+        market: Dict
+    ) -> Optional[Dict]:
+        """
+        Evaluate a single market for trading opportunity.
+        Returns opportunity dict if qualified, None otherwise.
+        """
+        ticker = market.get('ticker', '')
+        title = market.get('title', '')
+        
+        try:
+            # === FILTER 1: Basic checks ===
+            if not market.get('can_close_early', True):
+                logger.debug(f"{ticker}: Cannot close early, skip")
+                return None
+            
+            # Get market data with odds
+            market_with_odds = await self.kalshi_client.get_market_with_odds(ticker)
+            if not market_with_odds:
+                return None
+            
+            # Check spread and pricing
+            yes_ask = market_with_odds.get('yes_ask', 50)
+            yes_bid = market_with_odds.get('yes_bid', 50)
+            spread_cents = yes_ask - yes_bid
+            
+            if spread_cents < 0:
+                return None
+            
+            market_price_cents = yes_ask
+            market_prob = market_price_cents / 100.0
+            
+            # Calculate time to expiry
+            close_time_str = market.get('close_time')
+            if not close_time_str:
+                return None
+            
+            close_time = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            time_to_expiry = close_time - now
+            days_to_expiry = time_to_expiry.total_seconds() / 86400
+            
+            if days_to_expiry < 0.5:  # Less than 12 hours
+                logger.debug(f"{ticker}: Too close to expiry")
+                return None
+            
+            # Get volume
+            volume_24h = market.get('volume_24h', 0)
+            
+            # === FILTER 2: Market efficiency ===
+            is_efficient, efficiency_reason = self.efficiency_filter.is_efficient_market(
+                market, volume_24h
+            )
+            
+            if is_efficient:
+                logger.info(f"{ticker}: SKIP - {efficiency_reason}")
+                return None
+            
+            # Score inefficiency potential
+            inefficiency_score, ineff_explanation = self.efficiency_filter.score_inefficiency_potential(
+                market, volume_24h, days_to_expiry, spread_cents
+            )
+            
+            if inefficiency_score < self.MIN_INEFFICIENCY_SCORE:
+                logger.info(f"{ticker}: SKIP - {ineff_explanation}")
+                return None
+            
+            # === FILTER 3: Research ===
+            research_text = await self._get_research(event, market)
+            
+            if not research_text or len(research_text) < 100:
+                logger.info(f"{ticker}: SKIP - Insufficient research")
+                return None
+            
+            # Score research quality
+            research_quality, research_explanation = self.research_scorer.score_research(
+                research_text, title, event.get('title', '')
+            )
+            
+            if research_quality < self.MIN_RESEARCH_QUALITY:
+                logger.info(f"{ticker}: SKIP - {research_explanation}")
+                return None
+            
+            # Extract probability from research
+            research_prob = await self._extract_probability_from_research(
+                research_text, market, event
+            )
+            
+            if research_prob is None:
+                console.print(f"  [red]❌ {ticker}: Could not extract probability[/red]")
+                logger.info(f"{ticker}: SKIP - Could not extract probability")
+                return None
+            
+            console.print(f"  🎯 {ticker}: Research {research_prob*100:.1f}% vs Market {market_prob*100:.1f}%")
+            
+            # === FILTER 4: Edge calculation ===
+            edge_pct = abs(research_prob - market_prob) * 100
+            
+            if edge_pct < self.MIN_EDGE_PCT:
+                console.print(f"  [red]❌ {ticker}: Edge {edge_pct:.1f}% < {self.MIN_EDGE_PCT}%[/red]")
+                logger.info(f"{ticker}: SKIP - Edge too small ({edge_pct:.1f}%)")
+                return None
+            
+            console.print(f"  [green]✓ {ticker}: Edge {edge_pct:.1f}% ✓[/green]")
+            
+            # Calculate R-score (risk-adjusted edge)
+            variance = market_prob * (1 - market_prob)
+            r_score = (research_prob - market_prob) / math.sqrt(variance) if variance > 0 else 0
+            
+            if abs(r_score) < self.MIN_R_SCORE:
+                console.print(f"  [red]❌ {ticker}: R-score {r_score:.2f} < {self.MIN_R_SCORE}[/red]")
+                logger.info(f"{ticker}: SKIP - R-score too low ({r_score:.2f})")
+                return None
+            
+            console.print(f"  [green]✓ {ticker}: R-score {r_score:.2f} ✓[/green]")
+            
+            # === FILTER 5: Mispricing analysis ===
+            is_tradeable, mispricing_explanation, mispricing_conviction = await self.mispricing_analyzer.analyze_mispricing(
+                market, research_prob, market_prob, research_text, self.openai_client
+            )
+            
+            if not is_tradeable:
+                console.print(f"  [red]❌ {ticker}: Not tradeable - {mispricing_explanation[:50]}[/red]")
+                logger.info(f"{ticker}: SKIP - Not tradeable: {mispricing_explanation}")
+                return None
+            
+            if mispricing_conviction < self.MIN_MISPRICING_CONVICTION:
+                console.print(f"  [red]❌ {ticker}: Conviction {mispricing_conviction:.1f} < {self.MIN_MISPRICING_CONVICTION}[/red]")
+                logger.info(f"{ticker}: SKIP - Low conviction ({mispricing_conviction:.1f}/10)")
+                return None
+            
+            console.print(f"  [bold green]✓✓✓ {ticker}: QUALIFIED! (Edge {edge_pct:.1f}%, R {r_score:.2f}, Conv {mispricing_conviction:.1f})[/bold green]")
+            
+            if not is_tradeable:
+                logger.info(f"{ticker}: SKIP - Not tradeable: {mispricing_explanation}")
+                return None
+            
+            if mispricing_conviction < self.MIN_MISPRICING_CONVICTION:
+                logger.info(f"{ticker}: SKIP - Low conviction ({mispricing_conviction:.1f}/10)")
+                return None
+            
+            # === CALCULATE QUALITY SCORE ===
+            quality_score = self._calculate_quality_score(
+                inefficiency_score,
+                research_quality,
+                mispricing_conviction,
+                edge_pct,
+                abs(r_score),
+            )
+            
+            logger.info(
+                f"{ticker}: QUALIFIED ✓ "
+                f"Quality={quality_score:.1f}/10, Edge={edge_pct:.1f}%, "
+                f"R={r_score:.2f}, Conv={mispricing_conviction:.1f}/10"
+            )
+            
+            # Determine action (YES or NO)
+            action = "buy_yes" if research_prob > market_prob else "buy_no"
+            
+            return {
+                'ticker': ticker,
+                'event_ticker': event.get('event_ticker', ''),
+                'market': market,
+                'event': event,
+                'action': action,
+                'research_prob': research_prob,
+                'market_prob': market_prob,
+                'edge_pct': edge_pct,
+                'r_score': r_score,
+                'quality_score': quality_score,
+                'inefficiency_score': inefficiency_score,
+                'research_quality': research_quality,
+                'mispricing_conviction': mispricing_conviction,
+                'research_text': research_text,
+                'mispricing_explanation': mispricing_explanation,
+                'days_to_expiry': days_to_expiry,
+            }
+            
+        except Exception as e:
+            logger.error(f"Error evaluating {ticker}: {e}")
+            return None
+    
+    async def _execute_opportunities(self, opportunities: List[Dict]):
+        """Execute qualified opportunities based on quality and limits."""
+        if not opportunities:
+            return
+        
+        console.print("\n" + "="*70)
+        console.print("🎯 [bold cyan]Qualified Opportunities[/bold cyan]")
+        console.print("="*70 + "\n")
+        
+        # Show opportunities table
+        table = Table(title="High-Quality Trades", title_style="bold green")
+        table.add_column("Ticker", style="cyan", no_wrap=True)
+        table.add_column("Quality", justify="right", style="green")
+        table.add_column("Edge", justify="right", style="yellow")
+        table.add_column("R-Score", justify="right", style="magenta")
+        table.add_column("Conviction", justify="right", style="blue")
+        table.add_column("Action", justify="center", style="bold yellow")
+        
+        for opp in opportunities[:10]:  # Show top 10
+            quality_style = "bold green" if opp['quality_score'] >= 8.5 else "green" if opp['quality_score'] >= 7.0 else "yellow"
+            table.add_row(
+                opp['ticker'],
+                f"[{quality_style}]{opp['quality_score']:.1f}/10[/{quality_style}]",
+                f"{opp['edge_pct']:.1f}%",
+                f"{opp['r_score']:.2f}σ",
+                f"{opp['mispricing_conviction']:.1f}/10",
+                f"🔼 {opp['action'].upper().replace('_', ' ')}" if 'yes' in opp['action'] else f"🔽 {opp['action'].upper().replace('_', ' ')}",
+            )
+        
+        if len(opportunities) > 10:
+            table.add_row("...", "...", "...", "...", "...", "...")
+        
+        console.print(table)
+        console.print()
+        
+        # Execute trades based on quality
+        console.print("💸 [bold cyan]Executing trades...[/bold cyan]\n")
+        
+        positions_taken = 0
+        
+        for i, opp in enumerate(opportunities, 1):
+            # Check quality-based limits
+            max_positions = self._get_max_positions_for_quality(opp['quality_score'])
+            
+            if positions_taken >= max_positions:
+                console.print(
+                    f"[yellow]⚠️  Reached position limit for this quality tier "
+                    f"({positions_taken}/{max_positions})[/yellow]"
+                )
+                break
+            
+            # Calculate position size
+            position_size = self._calculate_position_size(opp)
+            
+            if position_size < 1.0:
+                console.print(f"[dim]⏭️  Skipping {opp['ticker']}: Position size too small (${position_size:.2f})[/dim]")
+                continue
+            
+            # Execute trade
+            success = await self._execute_trade(opp, position_size)
+            
+            if success:
+                positions_taken += 1
+                self.daily_positions_taken += 1
+        
+        console.print("\n" + "="*70)
+        if positions_taken > 0:
+            console.print(f"✅ [bold green]Executed {positions_taken} trades[/bold green]")
+        else:
+            console.print("[yellow]No trades executed (position sizes too small or limits reached)[/yellow]")
+        console.print("="*70)
+    
+    def _calculate_position_size(self, opportunity: Dict) -> float:
+        """Calculate position size using Kelly criterion with limits."""
+        # Kelly fraction: f = (p*odds - q) / odds
+        # Where p = research_prob, q = 1-p, odds = payout if correct
+        
+        research_prob = opportunity['research_prob']
+        market_prob = opportunity['market_prob']
+        is_yes = opportunity['action'] == "buy_yes"
+        
+        if is_yes:
+            # Buying YES at market_prob
+            # If correct, get 1.0, pay market_prob
+            # Payout = (1.0 - market_prob) / market_prob
+            if market_prob >= 0.99:
+                return 0.0
+            payout = (1.0 - market_prob) / market_prob
+            kelly_fraction = (research_prob * payout - (1 - research_prob)) / payout
+        else:
+            # Buying NO (equivalent to shorting YES at 1-market_prob)
+            no_price = 1.0 - market_prob
+            if no_price >= 0.99:
+                return 0.0
+            payout = (1.0 - no_price) / no_price
+            no_prob = 1.0 - research_prob  # Prob that NO wins
+            kelly_fraction = (no_prob * payout - research_prob) / payout
+        
+        # Apply fractional Kelly
+        adjusted_kelly = kelly_fraction * self.BASE_KELLY_FRACTION
+        
+        # Get bankroll
+        capital_state = self.capital_manager.capital_state
+        if not capital_state:
+            logger.warning("No capital state, using small position")
+            return 5.0
+        
+        bankroll = capital_state.total_balance
+        
+        # Calculate raw size
+        raw_size = bankroll * adjusted_kelly
+        
+        # Apply max limits
+        max_size_pct = bankroll * self.MAX_POSITION_SIZE_PCT
+        size = min(raw_size, max_size_pct)
+        
+        # Apply capital manager limits
+        size = self.capital_manager.calculate_safe_position_size(
+            size,
+            opportunity['event_ticker'],
+            opportunity['ticker'],
+        )
+        
+        return max(0, size)
+    
+    async def _execute_trade(self, opportunity: Dict, position_size: float) -> bool:
+        """Execute a single trade with beautiful output."""
+        ticker = opportunity['ticker']
+        action = opportunity['action']
+        
+        # Create a mini table for this trade
+        trade_table = Table(show_header=False, box=None, padding=(0, 1))
+        trade_table.add_column("Field", style="cyan")
+        trade_table.add_column("Value", style="white")
+        
+        quality_color = "bold green" if opportunity['quality_score'] >= 8.5 else "green" if opportunity['quality_score'] >= 7.0 else "yellow"
+        
+        trade_table.add_row("📊 Market", ticker)
+        trade_table.add_row("💰 Size", f"${position_size:.2f}")
+        trade_table.add_row("✨ Quality", f"[{quality_color}]{opportunity['quality_score']:.1f}/10[/{quality_color}]")
+        trade_table.add_row("📈 Edge", f"[yellow]{opportunity['edge_pct']:.1f}%[/yellow] ({opportunity['r_score']:.2f}σ)")
+        trade_table.add_row("🎯 Conviction", f"[blue]{opportunity['mispricing_conviction']:.1f}/10[/blue]")
+        trade_table.add_row("💡 Thesis", opportunity['mispricing_explanation'][:100] + "...")
+        
+        console.print(f"\n{'='*70}")
+        console.print(f"🎲 [bold yellow]EXECUTING TRADE: {action.upper().replace('_', ' ')}[/bold yellow]")
+        console.print(f"{'='*70}")
+        console.print(trade_table)
+        
+        if self.config.dry_run:
+            console.print(f"\n[bold green]✅ DRY RUN - Trade logged (not executed)[/bold green]")
+            console.print(f"{'='*70}\n")
+            return True
+        
+        try:
+            # Execute real trade
+            side = "yes" if action == "buy_yes" else "no"
+            
+            # Use limit order at current ask
+            market = await self.kalshi_client.get_market_with_odds(ticker)
+            if not market:
+                console.print(f"[red]❌ Could not fetch market data for {ticker}[/red]")
+                return False
+            limit_price = market.get(f'{side}_ask', 50)
+            
+            contracts = int(position_size * 100 / limit_price)  # Convert dollars to contracts
+            
+            if contracts < 1:
+                console.print(f"\n[yellow]⚠️  Less than 1 contract, skipping[/yellow]")
+                console.print(f"{'='*70}\n")
+                return False
+            
+            console.print(f"\n[cyan]Placing order: {contracts} contracts @ {limit_price}¢ (${position_size:.2f})...[/cyan]")
+            
+            result = await self.kalshi_client.place_order(
+                ticker=ticker,
+                side=side,
+                amount=position_size,  # Dollar amount
+            )
+            
+            if result.get('status') == 'success':
+                console.print(f"[bold green]✅ ORDER FILLED: {contracts} contracts @ {limit_price}¢[/bold green]")
+                console.print(f"{'='*70}\n")
+                return True
+            else:
+                console.print(f"[red]❌ Order failed: {result}[/red]")
+                console.print(f"{'='*70}\n")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error executing trade for {ticker}: {e}")
+            console.print(f"[red]  ❌ Error: {e}[/red]")
+            return False
+    
+    async def _handle_exit_signals(self, exit_signals: List):
+        """Handle exit signals for positions with beautiful output."""
+        
+        # Create exit signals table
+        exit_table = Table(title="⚠️  Position Exit Signals", title_style="bold yellow")
+        exit_table.add_column("Ticker", style="cyan", no_wrap=True)
+        exit_table.add_column("Reason", style="yellow")
+        exit_table.add_column("Urgency", justify="center")
+        exit_table.add_column("Edge", justify="right", style="magenta")
+        exit_table.add_column("P&L", justify="right")
+        exit_table.add_column("Action", justify="center", style="bold")
+        
+        for signal in exit_signals:
+            # Color P&L
+            pnl_style = "bold green" if signal.current_pnl_pct > 0 else "bold red"
+            pnl_text = f"[{pnl_style}]{signal.current_pnl_pct*100:+.1f}%[/{pnl_style}]"
+            
+            # Urgency emoji
+            urgency_emoji = "🔴" if signal.urgency == "high" else "🟡" if signal.urgency == "medium" else "🟢"
+            
+            # Action color
+            action_style = "bold red" if signal.recommendation == "exit_now" else "yellow" if signal.recommendation == "exit_when_convenient" else "green"
+            
+            exit_table.add_row(
+                signal.ticker,
+                signal.reason[:50],
+                f"{urgency_emoji} {signal.urgency}",
+                f"{signal.current_edge:.1f}pp",
+                pnl_text,
+                f"[{action_style}]{signal.recommendation.replace('_', ' ').upper()}[/{action_style}]",
+            )
+        
+        console.print(exit_table)
+        console.print()
+        
+        # Execute exits
+        for signal in exit_signals:
+            if signal.recommendation == "exit_now":
+                console.print(f"\n[bold red]🚨 EXITING: {signal.ticker}[/bold red]")
+                console.print(f"[red]Reason: {signal.reason}[/red]")
+                
+                if self.config.dry_run:
+                    console.print("[green]✓ DRY RUN - Would exit position[/green]")
+                else:
+                    try:
+                        result = await self.position_manager.exit_position(signal.ticker)
+                        if result:
+                            console.print("[bold green]✅ Position exited successfully[/bold green]")
+                        else:
+                            console.print("[red]❌ Exit failed[/red]")
+                    except Exception as e:
+                        console.print(f"[red]❌ Error: {e}[/red]")
+            
+            elif signal.recommendation == "exit_when_convenient":
+                console.print(f"\n[yellow]⚠️  Monitoring: {signal.ticker}[/yellow]")
+                console.print(f"[dim]Will exit when opportune: {signal.reason}[/dim]")
+    
+    async def _get_research(self, event: Dict, market: Dict) -> str:
+        """
+        Get research for market using DUAL method (Octagon + Perplexity).
+        Combines structured analysis with real-time web data.
+        """
+        ticker = market.get('ticker', '')
+        
+        # Check cache
+        if ticker in self.research_cache:
+            research, timestamp = self.research_cache[ticker]
+            age = datetime.now(timezone.utc) - timestamp
+            if age.total_seconds() < 3600:  # 1 hour cache
+                console.print(f"[dim]📦 Using cached research for {ticker}[/dim]")
+                return research
+        
+        # Fetch research from BOTH sources
+        octagon_research = ""
+        perplexity_research = ""
+        
+        console.print(f"\n[cyan]🔬 Researching: {ticker}[/cyan]")
+        
+        try:
+            # Source 1: Octagon (structured analysis)
+            console.print("[dim]  → Calling Octagon...[/dim]")
+            octagon_research = await self.research_client.research_event(
+                event,
+                [market],
+            )
+            if octagon_research:
+                console.print(f"[green]  ✓ Octagon: {len(octagon_research)} chars[/green]")
+            else:
+                console.print("[yellow]  ⚠️  Octagon: No data[/yellow]")
+        except Exception as e:
+            console.print(f"[red]  ✗ Octagon failed: {e}[/red]")
+        
+        # Source 2: Perplexity (real-time web data)
+        console.print(f"[dim]  Perplexity check: enabled={self.perplexity_enabled}, client={self.perplexity_client is not None}[/dim]")
+        if self.perplexity_enabled and self.perplexity_client:
+            try:
+                console.print("[bold cyan]  → Calling Perplexity API (real-time web search)...[/bold cyan]")
+                logger.warning(f"PERPLEXITY API CALL STARTING: {ticker} - {event.get('title', '')}")
+                
+                perplexity_research = await self.perplexity_client.fetch_event_research(
+                    event_ticker=event.get('event_ticker', ''),
+                    event_title=event.get('title', ''),
+                    event_description=event.get('subtitle', ''),
+                    category=event.get('category', ''),
+                    sub_category=event.get('sub_category', ''),
+                )
+                
+                if perplexity_research and len(perplexity_research) > 50:
+                    console.print(f"[bold green]  ✓ Perplexity SUCCESS: {len(perplexity_research)} chars received[/bold green]")
+                    logger.warning(f"PERPLEXITY RESPONSE: {len(perplexity_research)} chars - {perplexity_research[:100]}...")
+                else:
+                    console.print("[yellow]  ⚠️  Perplexity: No valid data returned[/yellow]")
+                    logger.warning(f"PERPLEXITY EMPTY RESPONSE: {perplexity_research}")
+            except Exception as perplexity_error:
+                console.print(f"[red]  ✗ Perplexity API error: {perplexity_error}[/red]")
+                logger.warning(f"PERPLEXITY ERROR: {type(perplexity_error).__name__}: {perplexity_error}")
+                perplexity_research = None
+        else:
+            if not self.perplexity_enabled:
+                console.print("[dim]  ⊘ Perplexity: Not enabled in config[/dim]")
+                logger.warning("PERPLEXITY SKIPPED: Not enabled")
+            elif self.perplexity_client is None:
+                console.print("[red]  ✗ Perplexity client is None (initialization failed)[/red]")
+                logger.warning("PERPLEXITY SKIPPED: Client not initialized")
+            else:
+                console.print("[yellow]  ⚠️  Perplexity: Unknown state[/yellow]")
+                logger.warning("PERPLEXITY SKIPPED: Unknown reason")
+        
+        # Combine research sources
+        combined_research = ""
+        
+        if octagon_research and perplexity_research:
+            # DUAL SOURCE - Best quality!
+            combined_research = f"""=== STRUCTURED ANALYSIS (Octagon) ===
+{octagon_research}
+
+=== REAL-TIME WEB DATA (Perplexity) ===
+{perplexity_research}
+"""
+            console.print(f"[bold green]✓ DUAL SOURCE: {ticker}[/bold green]")
+        elif octagon_research:
+            # Single source: Octagon only
+            combined_research = octagon_research
+            console.print(f"[yellow]⚠️  Single source (Octagon only): {ticker}[/yellow]")
+        elif perplexity_research:
+            # Single source: Perplexity only
+            combined_research = perplexity_research
+            console.print(f"[yellow]⚠️  Single source (Perplexity only): {ticker}[/yellow]")
+        else:
+            # No research available
+            console.print(f"[red]❌ No research available: {ticker}[/red]")
+            return ""
+        
+        # Cache combined research
+        if combined_research:
+            self.research_cache[ticker] = (combined_research, datetime.now(timezone.utc))
+        
+        return combined_research
+    
+    async def _extract_probability_from_research(
+        self, 
+        research_text: str,
+        market: Dict,
+        event: Dict,
+    ) -> Optional[float]:
+        """Extract probability estimate from research text."""
+        try:
+            prompt = f"""Extract the probability estimate from this research.
+
+Market: {market.get('title', '')}
+
+Research:
+{research_text[:1000]}
+
+What is the probability that YES will win (0-100)?
+
+Return ONLY a JSON object:
+{{
+  "probability": <number 0-100>,
+  "confidence": <number 0-1>
+}}
+"""
+            
+            response = await self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You extract probability estimates from research."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            prob = float(result.get('probability', 50)) / 100.0
+            
+            # Clamp to reasonable range
+            prob = max(0.01, min(0.99, prob))
+            
+            return prob
+            
+        except Exception as e:
+            logger.error(f"Error extracting probability: {e}")
+            return None
+    
+    async def close(self):
+        """Cleanup resources."""
+        try:
+            await self.research_client.close()
+        except:
+            pass
+        
+        try:
+            if self.perplexity_client:
+                await self.perplexity_client.close()
+        except:
+            pass
 
 
-async def main(live_trading: bool = False, max_close_ts: Optional[int] = None):
+async def main():
     """Main entry point."""
-    bot = SimpleTradingBot(live_trading=live_trading, max_close_ts=max_close_ts)
-    await bot.run()
+    try:
+        # Load configuration
+        config = load_config()
+        
+        # Create and run bot
+        bot = KalshiInstitutionalBot(config)
+        await bot.run()
+        await bot.close()
+        
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+    except Exception as e:
+        logger.error(f"Fatal error", exc_info=True)
+        console.print(f"\n[red]Fatal error: {e}[/red]")
 
 
 def cli():
-    """Command line interface entry point."""
-    parser = argparse.ArgumentParser(
-        description=(
-            "Simple Kalshi trading bot with Octagon research and "
-            "OpenAI decision making"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  uv run trading-bot                    # Run bot in dry run mode (default)
-  uv run trading-bot --live             # Run bot with live trading enabled
-  uv run trading-bot --help             # Show this help message
-
-Configuration:
-  Create a .env file with your API keys:
-    KALSHI_API_KEY=your_kalshi_api_key
-    KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----"
-    OCTAGON_API_KEY=your_octagon_api_key
-    OPENAI_API_KEY=your_openai_api_key
-
-  Optional settings:
-    KALSHI_USE_DEMO=true               # Use demo environment (default: true)
-    MAX_EVENTS_TO_ANALYZE=50           # Max events to analyze (default: 50)
-    MAX_BET_AMOUNT=2.0                 # Max bet per market (default tightened)
-    RESEARCH_BATCH_SIZE=10             # Parallel research requests (default: 10)
-    SKIP_EXISTING_POSITIONS=true       # Skip markets with existing positions
-    Z_THRESHOLD=2.0                    # Minimum R-score (z-score) for betting
-    MIN_CONFIDENCE_TO_BET=0.7          # Minimum confidence for any bet
-    MIN_EDGE_POINTS=10.0               # Min edge (percentage points) vs market
-    KELLY_FRACTION=0.25                # Fraction of Kelly for sizing
-    BANKROLL=500.0                     # Total bankroll for Kelly calculations
-
-  Trading modes:
-    Default: Dry run mode - shows what trades would be made without placing real bets
-    --live: Live trading mode - actually places bets (use with caution!)
-        """,
-    )
-
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Enable live trading (default: dry run mode)",
-    )
-    parser.add_argument(
-        "--max-expiration-hours",
-        type=int,
-        default=None,
-        dest="max_expiration_hours",
-        help=(
-            "Only include markets that close within this many hours from now "
-            "(minimum 1 hour)."
-        ),
-    )
-
-    parser.add_argument(
-        "--version",
-        action="version",
-        version="Kalshi Trading Bot 1.0.0",
-    )
-
-    args = parser.parse_args()
-
-    try:
-        max_close_ts = None
-        if args.max_expiration_hours is not None:
-            hours = max(1, args.max_expiration_hours)
-            max_close_ts = int(time.time()) + (hours * 3600)
-        asyncio.run(main(live_trading=args.live, max_close_ts=max_close_ts))
-    except Exception as e:
-        console = Console()
-        console.print(f"[red]Error: {e}[/red]")
-        console.print("\n[yellow]Please check your .env file configuration.[/yellow]")
-        console.print("[yellow]Run with --help for more information.[/yellow]")
-        sys.exit(1)
+    """Console script entry point (for setup.py console_scripts)."""
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
-    cli()
+    asyncio.run(main())
